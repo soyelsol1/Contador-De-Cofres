@@ -1,0 +1,7 @@
+{
+  "version": "1.1.0",
+  "archivo": "contador_cofres.py",
+  "sha256": "9f080785549bb4690629df781632432fc1189956be07ce3f42b61d2656f0d0a0",
+  "obligatoria": false,
+  "notas": "• Actualización automática: el programa se actualiza solo desde GitHub\n• Copia de seguridad diaria de tus datos (carpeta «copias»)\n• Nueva estadística: cofres por hora\n• Botón «Buscar» actualizaciones en Ajustes"
+}
