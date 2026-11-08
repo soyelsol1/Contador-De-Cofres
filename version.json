@@ -1,7 +1,7 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.1",
   "archivo": "contador_cofres.py",
-  "sha256": "9f080785549bb4690629df781632432fc1189956be07ce3f42b61d2656f0d0a0",
-  "obligatoria": false,
-  "notas": "• Actualización automática: el programa se actualiza solo desde GitHub\n• Copia de seguridad diaria de tus datos (carpeta «copias»)\n• Nueva estadística: cofres por hora\n• Botón «Buscar» actualizaciones en Ajustes"
+  "sha256": "46429bf35441d912d44e82041a5ab0908193473d1b64289c83b2e87e9f71efa8",
+  "obligatoria": true,
+  "notas": "Reloj y ritmo en directo, récord de partida, modo compacto y resumen al terminar la partida."
 }

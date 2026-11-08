@@ -110,7 +110,7 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.1.0"
+VERSION = "1.2.1"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 CARPETA_CODIGO = os.path.join(DATOS, "codigo")
 ARCHIVO_CODIGO = os.path.join(CARPETA_CODIGO, "contador_cofres.py")
@@ -388,6 +388,13 @@ def duracion(seg):
     if seg < 60:
         return "%d s" % seg
     return "%d min %02d s" % (seg // 60, seg % 60)
+
+
+def hms(seg):
+    seg = int(max(0, seg))
+    h, r = divmod(seg, 3600)
+    m, s = divmod(r, 60)
+    return ("%d:%02d:%02d" % (h, m, s)) if h else ("%02d:%02d" % (m, s))
 
 
 def es_hito(n):
@@ -744,6 +751,7 @@ def calcular_stats(partidas, actual, ahora):
     juegos = [p for p in partidas if p] + ([actual] if actual else [])
     hoy = fecha_madrid(ahora)
     por_dia = Counter()
+    por_hora = Counter()
     autos = manuales = partidas_hoy = 0
     dur_tot = cof_dur = 0
     gaps = []
@@ -752,6 +760,7 @@ def calcular_stats(partidas, actual, ahora):
         for ts, a in ev:
             d = fecha_madrid(ts)
             por_dia[d] += 1
+            por_hora[a_madrid(ts).hour] += 1
             if d == hoy:
                 hubo_hoy = True
             if a:
@@ -809,6 +818,8 @@ def calcular_stats(partidas, actual, ahora):
         "semana_pct": pct,
         "gap": (sum(gaps) / len(gaps)) if gaps else None,
         "cph": (cof_dur * 3600.0 / dur_tot) if dur_tot > 0 else None,
+        "mejor_hora": (max(por_hora, key=por_hora.get) if por_hora else None),
+        "mejor_hora_n": (max(por_hora.values()) if por_hora else 0),
         "autos": autos,
         "manuales": manuales,
         "dias14": dias14,
@@ -1841,7 +1852,7 @@ class Estadisticas:
         caja.pack(fill="x", pady=(0, 8))
         tk.Label(caja, text="OTROS DATOS", font=("Segoe UI Semibold", 9), fg=ORO_OSC, bg=PANEL).pack(
             anchor="w", padx=10, pady=(6, 2))
-        for clave in ("gap", "cph", "autos", "racha_max"):
+        for clave in ("gap", "cph", "hora", "autos", "racha_max"):
             lbl = tk.Label(caja, text="", font=("Segoe UI", 9), fg=TEXTO, bg=PANEL, anchor="w", justify="left")
             lbl.pack(fill="x", padx=10)
             self.v[clave] = lbl
@@ -1923,6 +1934,9 @@ class Estadisticas:
         v["autos"].config(text="Contados solos: %d   ·   Sumados a mano: %d" % (st["autos"], st["manuales"]))
         v["racha_max"].config(text="Mejor racha de días seguidos jugando:  %d" % st["mejor_racha"])
         v["cph"].config(text="Ritmo medio:  %s cofres/hora" % (f1(st["cph"]) if st["cph"] else "–"))
+        mh = st["mejor_hora"]
+        v["hora"].config(text="Tu mejor hora:  %s  (%d cofres)" % (("%02d:00 - %02d:00" % (mh, (mh + 1) % 24)), st["mejor_hora_n"])
+                         if mh is not None else "Tu mejor hora:  –")
 
         dias = [(n, "LMXJVSD"[d.weekday()], str(d.day)) for d, n in st["dias14"]]
         grafico_barras(self.cv_dias, dias, ORO_OSC, ORO, "media/día")
@@ -2062,6 +2076,9 @@ class App:
         self.upd_dlg = None
         self.upd_resultado = None
         self.upd_pospuesta = ""
+        self._ritmo_txt = None
+        self.nov_resultado = None
+        self.compacto = False
 
         if datos.get("geometria"):
             try:
@@ -2083,6 +2100,7 @@ class App:
         self.revisar_teclas()
         self.ciclo_amigo()
         self.root.after(1500, lambda: self.buscar_actualizaciones(False))
+        self.root.after(3000, self.pedir_novedades)
 
     # ---------- piezas de interfaz ----------
     def boton(self, padre, texto, comando, color, ancho=7):
@@ -2136,6 +2154,9 @@ class App:
         self.luz.pack(side="left")
         self.lbl_luz = tk.Label(est, text="esperando", font=("Segoe UI", 9), fg=APAGADO, bg=CARD)
         self.lbl_luz.pack(side="left", padx=(2, 0))
+        self.btn_compacto = self.boton_texto(cab, "▴", self.alternar_compacto, bg=CARD, fg=APAGADO)
+        self.btn_compacto.config(font=("Segoe UI", 12))
+        self.btn_compacto.pack(side="right", padx=(0, 8))
 
         # --- números grandes: total y partida ---
         self.panel_num = tk.Frame(marco, bg=PANEL)
@@ -2168,6 +2189,8 @@ class App:
             lbl = tk.Label(col, text="–", font=("Segoe UI Black", 16), fg=color, bg=PANEL)
             lbl.pack()
             self.res[clave] = lbl
+        self.lbl_ritmo = tk.Label(marco, text="", font=("Segoe UI", 9), fg=CIAN, bg=CARD)
+        self.lbl_ritmo.pack(pady=(4, 0))
 
         # --- meta (barra siempre visible) ---
         fm = tk.Frame(marco, bg=CARD)
@@ -2182,9 +2205,9 @@ class App:
         # --- botones ---
         botones = tk.Frame(marco, bg=CARD)
         botones.pack(pady=(6, 2))
-        self.btn_menos = self.boton(botones, "−1", lambda: self.sumar(-1, False), "#c0394b", 9)
+        self.btn_menos = self.boton(botones, "−1", lambda: self.sumar(-1, False), "#c0394b", 14)
         self.btn_menos.pack(side="left", padx=3)
-        self.btn_mas = self.boton(botones, "+1", lambda: self.sumar(1, False), "#2e9e5b", 9)
+        self.btn_mas = self.boton(botones, "+1", lambda: self.sumar(1, False), "#2e9e5b", 14)
         self.btn_mas.pack(side="left", padx=3)
         self.boton(botones, "✎ Editar", self.editar, MORADO, 9).pack(side="left", padx=3)
         botones2 = tk.Frame(marco, bg=CARD)
@@ -2208,7 +2231,6 @@ class App:
         self.btn_tabs = {}
         for clave, texto in (("amigos", "👥 Amigos"), ("pantalla", "🖥 En pantalla"), ("ajustes", "⚙ Ajustes")):
             fr = tk.Frame(self.zona, bg=PANEL)
-            fr.grid(row=0, column=0, sticky="nsew")
             self.tabs[clave] = fr
             b = tk.Button(self.barra_tabs, text=texto, command=lambda c=clave: self.mostrar_pestana(c),
                           relief="flat", bd=0, font=("Segoe UI Semibold", 10), cursor="hand2", pady=4)
@@ -2229,10 +2251,14 @@ class App:
         self.pintar_amigo(forzar=True)
         ini = self.cfg_ui.get("pestana")
         self.mostrar_pestana(ini if ini in self.tabs else "amigos", guardar=False)
+        self.aplicar_compacto(bool(self.cfg_ui.get("compacto")), guardar=False)
 
     def mostrar_pestana(self, clave, guardar=True):
         self.pestana = clave
-        self.tabs[clave].tkraise()
+        for c, fr in self.tabs.items():
+            if c != clave:
+                fr.pack_forget()
+        self.tabs[clave].pack(fill="x")
         for c, b in self.btn_tabs.items():
             if c == clave:
                 b.config(bg=PANEL, fg=ORO, activebackground=PANEL, activeforeground=ORO)
@@ -2268,7 +2294,7 @@ class App:
 
     def titulo_seccion(self, padre, texto):
         f = tk.Frame(padre, bg=PANEL)
-        f.pack(fill="x", pady=(8, 4))
+        f.pack(fill="x", pady=(6, 2))
         tk.Label(f, text=texto, font=("Segoe UI Semibold", 9), fg=ORO_OSC, bg=PANEL).pack(side="left")
         tk.Frame(f, bg="#3a3363", height=1).pack(side="left", fill="x", expand=True, padx=(8, 0), pady=(2, 0))
 
@@ -2339,9 +2365,6 @@ class App:
             side="left", padx=6)
         self.rejilla_chips(caja, [("🏁  Terminar partida en el lobby", self.var_lobby, self.guardar),
                                   ("🔍  Solo avisos de COFRE", self.var_solo_cofre, self.guardar)], columnas=2)
-        tk.Label(caja, text="«Solo avisos de COFRE» ignora la experiencia que da la partida por el tiempo.",
-                 font=("Segoe UI", 8), fg=APAGADO, bg=PANEL, wraplength=370, justify="left",
-                 anchor="w").pack(fill="x", pady=(2, 0))
 
         # --- sonido ---
         self.titulo_seccion(caja, "SONIDO")
@@ -2367,8 +2390,6 @@ class App:
         self.boton(f, "⌨ Atajos", self.dialogo_teclas, MORADO, 8).grid(row=0, column=0, sticky="ew", padx=3)
         self.boton(f, "📁 Datos", self.abrir_carpeta_datos, AZUL, 8).grid(row=0, column=1, sticky="ew", padx=3)
         self.boton(f, "🩺 Diagnóstico", self.diagnostico, "#4a4468", 8).grid(row=0, column=2, sticky="ew", padx=3)
-        tk.Label(caja, text="Tus datos están en: " + DATOS, font=("Segoe UI", 8), fg=APAGADO, bg=PANEL,
-                 anchor="w", wraplength=370, justify="left").pack(fill="x", pady=(6, 0))
         self.lbl_detalle = tk.Label(caja, text="", font=("Segoe UI", 8), fg=APAGADO, bg=PANEL,
                                     wraplength=370, justify="left", anchor="w")
         self.lbl_detalle.pack(fill="x", pady=(2, 0))
@@ -2397,8 +2418,7 @@ class App:
         if p and os.path.isfile(p):
             self.lbl_sonido.config(text="Tu sonido: %s  (vale WAV, MP3, WMA o M4A)" % os.path.basename(p))
         else:
-            self.lbl_sonido.config(text="Elige uno de la lista o pulsa «Mi sonido…» para usar el tuyo "
-                                        "(WAV, MP3, WMA o M4A).")
+            self.lbl_sonido.config(text="Admite WAV, MP3, WMA o M4A.")
 
     def al_elegir_sonido(self, valor=None):
         self.cfg_son["elegido"] = self.var_sonido.get()
@@ -2485,6 +2505,61 @@ class App:
             self.stats = None
         else:
             self.stats = Estadisticas(self)
+
+    # ---------- modo compacto, ritmo y novedades ----------
+    def aplicar_compacto(self, valor, guardar=True):
+        self.compacto = bool(valor)
+        self.barra_tabs.pack_forget()
+        self.zona.pack_forget()
+        if not self.compacto:
+            self.barra_tabs.pack(fill="x", padx=12, pady=(8, 0), before=self.lbl_estado)
+            self.zona.pack(fill="x", padx=12, before=self.lbl_estado)
+        self.btn_compacto.config(text="▾" if self.compacto else "▴")
+        self.cfg_ui["compacto"] = self.compacto
+        if guardar:
+            self.guardar()
+
+    def alternar_compacto(self):
+        self.aplicar_compacto(not self.compacto)
+
+    def pintar_ritmo(self):
+        ev = self.hist.actual
+        if ev:
+            seg = max(0.0, time.time() - ev[0][0])
+            txt = "⏱ %s" % hms(seg)
+            if len(ev) >= 2 and seg >= 60:
+                txt += "   ·   %s cofres/hora" % f1(len(ev) * 3600.0 / seg)
+        else:
+            txt = "⏱ Sin partida en curso"
+        if txt != self._ritmo_txt:
+            self._ritmo_txt = txt
+            self.lbl_ritmo.config(text=txt)
+
+    def pedir_novedades(self):
+        if self.cfg_ui.get("ver_vista") == VERSION:
+            return
+
+        def tarea():
+            try:
+                d = json.loads(_get_raw("version.json").decode("utf-8-sig"))
+                self.nov_resultado = d if isinstance(d, dict) else {}
+            except Exception:
+                self.nov_resultado = {}
+
+        threading.Thread(target=tarea, daemon=True).start()
+
+    def revisar_novedades(self):
+        d = self.nov_resultado
+        if d is None:
+            return
+        self.nov_resultado = None
+        if str(d.get("version")) != VERSION:
+            return
+        self.cfg_ui["ver_vista"] = VERSION
+        self.guardar()
+        notas = str(d.get("notas") or "").strip()
+        if notas:
+            messagebox.showinfo("Novedades de la versión %s" % VERSION, notas, parent=self.root)
 
     # ---------- meta ----------
     def meta_info(self):
@@ -2574,7 +2649,11 @@ class App:
     # ---------- teclas ----------
     def texto_tecla(self, accion):
         t = self.cfg_teclas.get(accion, "Ninguna")
-        return "" if t == "Ninguna" else "  [%s]" % t
+        if t == "Ninguna":
+            return ""
+        t = (t.replace("Ratón: lateral 1", "Ratón 4").replace("Ratón: lateral 2", "Ratón 5")
+              .replace("Ratón: rueda (clic)", "Rueda").replace("Bloq Mayús", "BloqMay"))
+        return "  [%s]" % t
 
     def actualizar_textos_teclas(self):
         self.btn_menos.config(text="−1" + self.texto_tecla("restar"))
@@ -3263,6 +3342,8 @@ class App:
             self.pintar_gestion()
             self.pintar_resumen()
             self.revisar_resultado_actualizacion()
+            self.pintar_ritmo()
+            self.revisar_novedades()
             if self.stats is not None:
                 if self.stats.vivo():
                     self.stats.refrescar()
@@ -3450,7 +3531,8 @@ class App:
         datos["teclas"] = self.cfg_teclas
         datos["meta"] = self.cfg_meta
         datos["sonido"] = self.cfg_son
-        datos["ui"] = {"pestana": self.pestana}
+        self.cfg_ui["pestana"] = self.pestana
+        datos["ui"] = self.cfg_ui
         datos["lobby"] = bool(self.var_lobby.get())
         datos["celebrar"] = bool(self.var_celebrar.get())
         datos["pitido"] = bool(self.var_pitido.get())
@@ -3481,6 +3563,10 @@ class App:
                 hito = ("¡META CONSEGUIDA!", True)
             elif es_hito(self.total):
                 hito = ("¡%d COFRES!" % self.total, self.total % 500 == 0)
+            if hito is None:
+                rec = max((len(pt) for pt in self.hist.partidas), default=0)
+                if rec >= 5 and self.sesion == rec + 1:
+                    hito = ("¡RÉCORD DE PARTIDA! %d" % self.sesion, True)
 
         # 1) lo que se oye y se ve, al instante (suena también al sumar a mano)
         if n > 0 and self.var_pitido.get() and not hito:
@@ -3513,6 +3599,13 @@ class App:
     def nueva_partida(self, auto=False):
         """Guarda la partida en el historial y pone a 0 solo el contador de la partida;
         el total no se toca."""
+        resumen = ""
+        ev = self.hist.actual
+        if ev:
+            dur = max(0, ev[-1][0] - ev[0][0])
+            resumen = "Partida: %d cofres en %s" % (len(ev), hms(dur))
+            if len(ev) >= 2 and dur >= 60:
+                resumen += " (%s/hora)" % f1(len(ev) * 3600.0 / dur)
         guardada = self.hist.cerrar()
         self.sesion = 0
         self.lbl_sesion.config(text="0")
@@ -3522,9 +3615,10 @@ class App:
         self.pintar_resumen()
         self.refrescar_overlay()
         self.sync.publicar(self.cfg_on.get("nombre", ""), self.total, self.sesion)
-        if auto:
-            self.aviso("Lobby detectado: partida terminada y guardada." if guardada
-                       else "Lobby detectado: nueva partida.")
+        if resumen:
+            self.aviso(("Lobby detectado. " if auto else "") + resumen + " · guardada.", 20)
+        elif auto:
+            self.aviso("Lobby detectado: nueva partida.")
 
     # ---------- captura ----------
     def region_juego(self):
