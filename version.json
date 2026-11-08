@@ -1,7 +1,7 @@
 {
-  "version": "1.2.1",
+  "version": "1.2.2",
   "archivo": "contador_cofres.py",
-  "sha256": "46429bf35441d912d44e82041a5ab0908193473d1b64289c83b2e87e9f71efa8",
+  "sha256": "396d5d28082c454e39dbbdbb50c8fa8614f2bb590f9fd25548952c614cb887bb",
   "obligatoria": true,
-  "notas": "Reloj y ritmo en directo, récord de partida, modo compacto y resumen al terminar la partida."
+  "notas": "Ya no se guardan fotos en tu PC (se borran solas al abrir). Si quieres activarlas, está en Ajustes."
 }

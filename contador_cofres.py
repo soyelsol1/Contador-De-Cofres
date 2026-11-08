@@ -110,7 +110,7 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 CARPETA_CODIGO = os.path.join(DATOS, "codigo")
 ARCHIVO_CODIGO = os.path.join(CARPETA_CODIGO, "contador_cofres.py")
@@ -2004,6 +2004,7 @@ class App:
         self.ini_pitido = bool(datos.get("pitido", True))
         self.ini_pantalla = str(datos.get("pantalla", "Auto"))
         self.ini_solo = bool(datos.get("solo_cofre", True))
+        self.ini_fotos = bool(datos.get("fotos", False))
         self.cfg_teclas = dict(TECLAS_DEF)
         guardadas = datos.get("teclas")
         if isinstance(guardadas, dict):
@@ -2101,6 +2102,8 @@ class App:
         self.ciclo_amigo()
         self.root.after(1500, lambda: self.buscar_actualizaciones(False))
         self.root.after(3000, self.pedir_novedades)
+        if not self.var_fotos.get():
+            self.borrar_fotos()          # limpia las fotos antiguas al abrir
 
     # ---------- piezas de interfaz ----------
     def boton(self, padre, texto, comando, color, ancho=7):
@@ -2350,6 +2353,7 @@ class App:
         self.var_celebrar = tk.BooleanVar(value=self.ini_celebrar)
         self.var_lobby = tk.BooleanVar(value=self.ini_lobby)
         self.var_solo_cofre = tk.BooleanVar(value=self.ini_solo)
+        self.var_fotos = tk.BooleanVar(value=self.ini_fotos)
         self.var_pantalla = tk.StringVar(
             value=self.ini_pantalla if self.ini_pantalla in opciones_pantalla else "Auto")
         self.var_sonido = tk.StringVar(value=self.cfg_son["elegido"])
@@ -2365,6 +2369,8 @@ class App:
             side="left", padx=6)
         self.rejilla_chips(caja, [("🏁  Terminar partida en el lobby", self.var_lobby, self.guardar),
                                   ("🔍  Solo avisos de COFRE", self.var_solo_cofre, self.guardar)], columnas=2)
+        self.rejilla_chips(caja, [("📸  Guardar fotos de las detecciones (ocupa espacio)", self.var_fotos,
+                                   self.al_cambiar_fotos)], columnas=1)
 
         # --- sonido ---
         self.titulo_seccion(caja, "SONIDO")
@@ -3538,6 +3544,7 @@ class App:
         datos["pitido"] = bool(self.var_pitido.get())
         datos["pantalla"] = self.var_pantalla.get()
         datos["solo_cofre"] = bool(self.var_solo_cofre.get())
+        datos["fotos"] = bool(self.var_fotos.get())
         self.cfg_sucio = False
         self.error_guardado = not guardar_json(ARCHIVO, datos)
 
@@ -3711,11 +3718,22 @@ class App:
                     self.en_lobby = False
                     self.lobby_no = 0
 
+    def borrar_fotos(self):
+        try:
+            shutil.rmtree(CARPETA_DETECCIONES, ignore_errors=True)
+        except Exception:
+            pass
+
+    def al_cambiar_fotos(self):
+        if not self.var_fotos.get():
+            self.borrar_fotos()
+        self.guardar()
+
     def guardar_deteccion(self, n, origen=""):
         """Guarda la imagen de cada cofre contado solo: si alguna vez cuenta uno "de más",
         ahí tienes la foto de qué vio el programa (carpeta «detecciones»). Va en segundo plano
         para no retrasar el sonido."""
-        if self.ultima_img is None:
+        if not self.var_fotos.get() or self.ultima_img is None:
             return
         img = self.ultima_img.copy()
         nombre = time.strftime("%Y%m%d_%H%M%S") + "_x%d_%s.png" % (n, origen or "x")
@@ -3736,7 +3754,7 @@ class App:
         """Foto de los avisos de experiencia que NO se han tomado por cofre (con lo que se parecían
         a la palabra «COFRE»): si algún cofre tuyo no cuenta, ahí está la prueba (carpeta
         «detecciones\\otros»)."""
-        if not otros or self.ultima_img is None:
+        if not self.var_fotos.get() or not otros or self.ultima_img is None:
             return
         ahora = time.time()
         if ahora - self.t_otros < 15:
