@@ -1,7 +1,7 @@
 {
-  "version": "1.3.1",
+  "version": "1.3.2",
   "archivo": "contador_cofres.py",
-  "sha256": "7c6c6db8b6f09e3b08def285aafa61679e3265fafe440662e9d301e9c87660d2",
+  "sha256": "d1c5b2b1fa00e72725bc6083f9e906174affc154bb5f29508c560c32ef2febae",
   "obligatoria": true,
   "notas": "Mejor detección de cofres"
 }

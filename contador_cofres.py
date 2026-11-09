@@ -110,7 +110,7 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 # Base de datos de las salas: la misma para todo el mundo, ya viene dentro del programa.
 URL_SALAS = "https://cofres-7beb6-default-rtdb.europe-west1.firebasedatabase.app"
