@@ -19,7 +19,7 @@ import calendar
 import threading
 import http.client
 import urllib.parse
-from collections import Counter
+from collections import Counter, deque
 from ctypes import wintypes
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
@@ -110,8 +110,10 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.2.2"
+VERSION = "1.3.1"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
+# Base de datos de las salas: la misma para todo el mundo, ya viene dentro del programa.
+URL_SALAS = "https://cofres-7beb6-default-rtdb.europe-west1.firebasedatabase.app"
 CARPETA_CODIGO = os.path.join(DATOS, "codigo")
 ARCHIVO_CODIGO = os.path.join(CARPETA_CODIGO, "contador_cofres.py")
 CARPETA_COPIAS = os.path.join(DATOS, "copias")
@@ -226,8 +228,10 @@ def copia_diaria():
 
 ARCHIVO = os.path.join(DATOS, "contador_cofres.json")
 ARCHIVO_HIST = os.path.join(DATOS, "historial_cofres.json")
+ARCHIVO_LOG = os.path.join(DATOS, "errores.log")
 CARPETA_SONIDOS = os.path.join(DATOS, "sonidos")
 CARPETA_DETECCIONES = os.path.join(DATOS, "detecciones")
+CARPETA_FALLOS = os.path.join(DATOS, "fallos")
 
 # Zona de la pantalla donde salen los avisos "+N PE / COFRE ..." (fracciones de la ventana del juego).
 # Es una franja alta para ver TODOS los avisos a la vez (si cogés dos cofres seguidos, se apilan).
@@ -365,15 +369,6 @@ def limpiar_sala(t):
     return re.sub(r"[^a-zA-Z0-9_-]", "", (t or "").strip())[:40].lower()
 
 
-def limpiar_url(u):
-    u = (u or "").strip().rstrip("/")
-    if u.endswith(".json"):
-        u = u[:-5].rstrip("/")
-    if u and not u.startswith(("http://", "https://")):
-        u = "https://" + u
-    return u
-
-
 def nombre_por_defecto():
     n = (os.environ.get("USERNAME") or "").strip()
     return (n or "Jugador")[:20]
@@ -413,6 +408,59 @@ def instancia_unica():
     except Exception:
         pass
     return True
+
+
+def registrar_error(texto):
+    """Apunta un error en errores.log (carpeta de datos) para poder revisarlo luego."""
+    try:
+        if os.path.isfile(ARCHIVO_LOG) and os.path.getsize(ARCHIVO_LOG) > 200000:
+            os.replace(ARCHIVO_LOG, ARCHIVO_LOG + ".old")
+        with open(ARCHIVO_LOG, "a", encoding="utf-8") as f:
+            f.write("%s  v%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), VERSION, texto))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- iniciar con Windows
+CLAVE_INICIO = r"Software\Microsoft\Windows\CurrentVersion\Run"
+NOMBRE_INICIO = "ContadorDeCofres"
+
+
+def _comando_inicio():
+    if getattr(sys, "frozen", False):
+        return '"%s"' % sys.executable
+    exe = sys.executable
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.isfile(pyw):
+        exe = pyw
+    return '"%s" "%s"' % (exe, os.path.abspath(sys.argv[0]))
+
+
+def inicio_windows_activo():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CLAVE_INICIO) as k:
+            winreg.QueryValueEx(k, NOMBRE_INICIO)
+        return True
+    except Exception:
+        return False
+
+
+def poner_inicio_windows(activar):
+    """Añade o quita el programa del arranque de Windows. Devuelve True si se pudo."""
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, CLAVE_INICIO) as k:
+            if activar:
+                winreg.SetValueEx(k, NOMBRE_INICIO, 0, winreg.REG_SZ, _comando_inicio())
+            else:
+                try:
+                    winreg.DeleteValue(k, NOMBRE_INICIO)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------- guardado seguro
@@ -466,23 +514,76 @@ def guardar_json(ruta, datos, **kw):
     return False
 
 
-# ---------------------------------------------------------------- hora de España
-@lru_cache(maxsize=16)
-def _limites_dst(anio):
-    """Horario de verano de la UE: del último domingo de marzo al último de octubre, 01:00 UTC."""
-    def ultimo_domingo(mes):
-        d = date(anio, mes, 31)
+# ---------------------------------------------------------------- zona horaria
+# (horas respecto a UTC en invierno, regla de horario de verano)
+ZONAS = {
+    "España (Península)": (1, "eu"),
+    "Canarias / Portugal / Reino Unido": (0, "eu"),
+    "Europa del Este (Atenas)": (2, "eu"),
+    "México (Centro)": (-6, None),
+    "Colombia / Perú / Ecuador": (-5, None),
+    "Argentina / Uruguay / Brasil": (-3, None),
+    "Nueva York (EE. UU. Este)": (-5, "us"),
+    "Los Ángeles (EE. UU. Oeste)": (-8, "us"),
+    "UTC": (0, None),
+}
+ZONA_AUTO = "Automática (la de este PC)"
+ZONA_DEF = "España (Península)"
+OPCIONES_ZONA = [ZONA_AUTO] + list(ZONAS)
+_zona = [ZONA_DEF]
+
+
+def poner_zona(nombre):
+    _zona[0] = nombre if (nombre == ZONA_AUTO or nombre in ZONAS) else ZONA_DEF
+
+
+def nombre_zona():
+    return _zona[0]
+
+
+def etiqueta_zona():
+    return "hora de este PC" if _zona[0] == ZONA_AUTO else "hora: " + _zona[0]
+
+
+@lru_cache(maxsize=32)
+def _limites_dst(anio, regla, base):
+    """Inicio y fin del horario de verano (marcas UTC). UE: último domingo de marzo a último
+    de octubre, 01:00 UTC. EE. UU.: segundo domingo de marzo a primer domingo de noviembre, 02:00 locales."""
+    def domingo(mes, n):
+        if n == -1:
+            d = date(anio, mes, 31)
+            while d.weekday() != 6:
+                d -= timedelta(days=1)
+            return d.day
+        d = date(anio, mes, 1)
         while d.weekday() != 6:
-            d -= timedelta(days=1)
-        return calendar.timegm((anio, mes, d.day, 1, 0, 0))
-    return ultimo_domingo(3), ultimo_domingo(10)
+            d += timedelta(days=1)
+        return d.day + 7 * (n - 1)
+
+    if regla == "us":
+        ini = calendar.timegm((anio, 3, domingo(3, 2), 2 - base, 0, 0))
+        fin = calendar.timegm((anio, 11, domingo(11, 1), 2 - (base + 1), 0, 0))
+        return ini, fin
+    return (calendar.timegm((anio, 3, domingo(3, -1), 1, 0, 0)),
+            calendar.timegm((anio, 10, domingo(10, -1), 1, 0, 0)))
 
 
 def a_madrid(ts):
-    """Marca de tiempo (UTC) -> fecha y hora de España peninsular (sin zona)."""
+    """Marca de tiempo (UTC) -> fecha y hora en la zona elegida (sin zona). El nombre se mantiene
+    por compatibilidad, pero ya no es siempre la hora de España."""
+    z = _zona[0]
+    if z == ZONA_AUTO:
+        try:
+            return datetime.fromtimestamp(ts)
+        except (OverflowError, OSError, ValueError):
+            z = ZONA_DEF
+    base, regla = ZONAS[z]
     dt = datetime.fromtimestamp(ts, timezone.utc)
-    ini, fin = _limites_dst(dt.year)
-    horas = 2 if ini <= ts < fin else 1
+    horas = base
+    if regla:
+        ini, fin = _limites_dst(dt.year, regla, base)
+        if ini <= ts < fin:
+            horas += 1
     return (dt + timedelta(hours=horas)).replace(tzinfo=None)
 
 
@@ -711,6 +812,17 @@ class Historial:
             self.guardar()
             return True
         return False
+
+    def deshacer_cierre(self):
+        """Reabre la última partida guardada (por si se cerró sin querer). Si ya has empezado
+        otra, sus cofres se juntan con los de la reabierta."""
+        if not self.partidas:
+            return False
+        ultima = self.partidas.pop()
+        self.actual = ultima + self.actual
+        self.version += 1
+        self.guardar()
+        return True
 
     def borrar_todo(self):
         """Vacía el historial (partidas y cofres por día). No toca tus contadores."""
@@ -976,6 +1088,7 @@ def _buscar_avisos_dos(img, depurar=False):
                        "tramos": len(_tramos(cols, 1)), "h": bh})
     F = None
     avisos = []
+    usadas = set()
     i = 0
     while i < len(bandas) - 1:
         A, B = bandas[i], bandas[i + 1]
@@ -983,6 +1096,7 @@ def _buscar_avisos_dos(img, depurar=False):
         info = {"y": A["y0"], "l1": A["n"], "l2": B["n"], "hA": A["h"], "hB": B["h"],
                 "wA": A["cmax"] - A["cmin"] + 1, "wB": B["cmax"] - B["cmin"] + 1, "hueco": hueco,
                 "tA": A["tramos"], "tB": B["tramos"], "dx": B["cmin"] - A["cmin"], "cofre": 0.0}
+        info["yb"] = B["y0"]
         info["ok"] = (0 <= hueco <= 10
                       and 8 <= info["hA"] <= 34 and 6 <= info["hB"] <= 28
                       and 0.45 <= info["hB"] / float(info["hA"]) <= 1.4
@@ -1007,11 +1121,43 @@ def _buscar_avisos_dos(img, depurar=False):
                     _CACHE_COFRE.clear()
                 _CACHE_COFRE[clave] = (ahora, info["cofre"])
             avisos.append(info)
+            usadas.update((i, i + 1))
             i += 2
         else:
             if depurar:
                 avisos.append(info)
             i += 1
+    if not depurar:
+        # Red de seguridad: una línea suelta que parece «COFRE ...» aunque no encaje en una pareja
+        # (por ejemplo, cuando otro aviso de experiencia está pegado y se funden las líneas).
+        for k, C in enumerate(bandas):
+            if k in usadas:
+                continue
+            wc = C["cmax"] - C["cmin"] + 1
+            if not (6 <= C["h"] <= 28 and 30 <= wc <= 330 and C["n"] >= 80
+                    and 0.15 <= C["n"] / float(wc * C["h"]) <= 0.9):
+                continue
+            if any(abs(a.get("yb", a.get("yc", -999)) - C["y0"]) <= 12 for a in avisos):
+                continue
+            n_arriba, _ = _region(datos, w, h, C["cmin"] - 14, C["cmax"] + 14, C["y0"] - 34, C["y0"] - 1)
+            if n_arriba < 40:
+                continue
+            if F is None:
+                gris = img.convert("L").point(_L_CONTRASTE)
+                F = ImageChops.multiply(gris, m.filter(ImageFilter.MaxFilter(7)).point(_L_BIN))
+            clave = (C["y0"], C["cmin"], C["cmax"], C["n"] // 15)
+            ahora = time.time()
+            c = _CACHE_COFRE.get(clave)
+            if c is not None and ahora - c[0] < 1.0:
+                sc = c[1]
+            else:
+                sc = puntuacion_cofre(F, C["cmin"] - 2, C["y0"], C["cmax"])
+                if len(_CACHE_COFRE) > 40:
+                    _CACHE_COFRE.clear()
+                _CACHE_COFRE[clave] = (ahora, sc)
+            if sc >= UMBRAL_COFRE:
+                avisos.append({"y": max(0, C["y0"] - 30), "yb": C["y0"], "l1": n_arriba, "l2": C["n"],
+                               "cofre": sc, "suelta": True, "ok": True})
     return avisos
 
 
@@ -1225,6 +1371,66 @@ class ErrorHTTP(Exception):
     def __init__(self, codigo):
         super().__init__("HTTP %d" % codigo)
         self.codigo = codigo
+
+
+def _pedir(metodo, ruta, cuerpo=None, timeout=8):
+    """Una consulta suelta a la base de datos de las salas (para crear / unirse)."""
+    p = urllib.parse.urlsplit(URL_SALAS)
+    c = http.client.HTTPSConnection(p.netloc, timeout=timeout)
+    try:
+        datos = None
+        cab = {}
+        if cuerpo is not None:
+            datos = json.dumps(cuerpo).encode("utf-8")
+            cab["Content-Type"] = "application/json"
+        c.request(metodo, p.path.rstrip("/") + ruta + ".json", body=datos, headers=cab)
+        r = c.getresponse()
+        txt = r.read().decode("utf-8")
+        if r.status >= 400:
+            raise ErrorHTTP(r.status)
+        return json.loads(txt) if txt else None
+    finally:
+        c.close()
+
+
+def estado_sala(sala):
+    """'libre' (no existe), 'vacia' (sin jugadores), 'vieja' (solo entradas de hace rato)
+    o 'viva' (alguien se ha conectado en los últimos 5 minutos)."""
+    d = _pedir("GET", "/salas/%s" % sala)
+    if not isinstance(d, dict):
+        return "libre"
+    j = d.get("j")
+    if not isinstance(j, dict) or not j:
+        return "vacia"
+    ahora = time.time() * 1000.0
+    for v in j.values():
+        t = v.get("t") if isinstance(v, dict) else None
+        if isinstance(t, (int, float)) and ahora - t < 300000:
+            return "viva"
+    return "vieja"
+
+
+def preparar_sala(modo, sala, pid):
+    """Comprueba la sala y, si crea, la deja lista con este jugador de líder.
+    Devuelve (True, "") o (False, mensaje para mostrar)."""
+    try:
+        estado = estado_sala(sala)
+        if modo == "crear":
+            if estado == "viva":
+                return False, "Ya existe una sala «%s» con gente dentro. Elige otro nombre, o pulsa «Unirse a sala»." % sala
+            if estado != "libre":
+                _pedir("DELETE", "/salas/%s" % sala)      # restos antiguos: se empieza limpio
+            _pedir("PUT", "/salas/%s/meta/lider" % sala, pid)
+            return True, ""
+        if estado in ("libre", "vacia"):
+            return False, "No existe ninguna sala «%s». Pídele el nombre exacto a quien la creó (o créala tú)." % sala
+        return True, ""
+    except ErrorHTTP as e:
+        if e.codigo in (401, 403):
+            return False, "El servidor no deja entrar (reglas de la base de datos)."
+        return False, "Error del servidor (%d). Inténtalo en un momento." % e.codigo
+    except Exception:
+        return False, "No hay conexión con el servidor. Revisa tu internet e inténtalo otra vez."
 
 
 class Sincronizador(threading.Thread):
@@ -1826,8 +2032,8 @@ class Estadisticas:
         cab = tk.Frame(marco, bg=CARD)
         cab.pack(fill="x", padx=12, pady=(10, 0))
         tk.Label(cab, text="ESTADÍSTICAS", font=("Segoe UI Semibold", 13), fg=ORO, bg=CARD).pack(side="left")
-        tk.Label(cab, text="Cada día va de 00:00 a 00:00 (hora de España)", font=("Segoe UI", 9),
-                 fg=CIAN, bg=CARD).pack(side="right")
+        self.lbl_zona = tk.Label(cab, text="", font=("Segoe UI", 9), fg=CIAN, bg=CARD)
+        self.lbl_zona.pack(side="right")
         tk.Label(marco, text="Solo cuenta lo que el programa ha contado desde que lo usas: "
                              "el total que escribes a mano no entra aquí.",
                  font=("Segoe UI", 8), fg=APAGADO, bg=CARD, anchor="w").pack(fill="x", padx=12)
@@ -1910,11 +2116,12 @@ class Estadisticas:
         if not self.vivo():
             return
         st = self.app.estadisticas()
-        sig = (self.app.hist.version, st["hoy_fecha"])
+        sig = (self.app.hist.version, st["hoy_fecha"], nombre_zona())
         if sig == self.sig and not forzar:
             return
         self.sig = sig
         v = self.v
+        self.lbl_zona.config(text="Cada día va de 00:00 a 00:00 (%s)" % etiqueta_zona())
         v["hoy"].config(text=str(st["hoy"]))
         v["partidas_hoy"].config(text=str(st["partidas_hoy"]))
         v["media_hoy"].config(text=f1(st["media_hoy"]) if st["media_hoy"] is not None else "–")
@@ -1986,6 +2193,7 @@ class App:
         copia_diaria()
 
         datos = self.cargar()
+        poner_zona(str(datos.get("zona", ZONA_DEF)))
         self.total = entero(datos.get("total", 0))
         self.sesion = entero(datos.get("partida", 0))
         self.cfg_ov = dict(datos.get("overlay", {})) if isinstance(datos.get("overlay"), dict) else {}
@@ -2005,6 +2213,7 @@ class App:
         self.ini_pantalla = str(datos.get("pantalla", "Auto"))
         self.ini_solo = bool(datos.get("solo_cofre", True))
         self.ini_fotos = bool(datos.get("fotos", False))
+        self.ini_obs = bool(datos.get("obs", False))
         self.cfg_teclas = dict(TECLAS_DEF)
         guardadas = datos.get("teclas")
         if isinstance(guardadas, dict):
@@ -2018,6 +2227,8 @@ class App:
             self.cfg_on["nombre"] = nombre_por_defecto()
         if not isinstance(self.cfg_on.get("alias"), dict):
             self.cfg_on["alias"] = {}
+        self.cfg_on["url"] = URL_SALAS        # la base de datos es siempre la misma
+        self.cfg_on["sala"] = limpiar_sala(self.cfg_on.get("sala", ""))
 
         self.hist = Historial(ARCHIVO_HIST)
         self._st = None
@@ -2027,6 +2238,9 @@ class App:
         # estado del detector de avisos
         self.avisos_conf = 0      # cuántos avisos de cofre damos por "ya contados" ahora mismo
         self.cand_n = 0
+        self.sube_hueco = 0
+        self.frames_recientes = deque(maxlen=8)
+        self.t_frame = 0.0
         self.sube = 0
         self.baja = 0
         self.ultimo_aviso = None
@@ -2080,6 +2294,9 @@ class App:
         self._ritmo_txt = None
         self.nov_resultado = None
         self.compacto = False
+        self.sesion_previa = None      # cofres de la partida que se cerró la última vez (para «Deshacer»)
+        self._obs_clave = None
+        self._ult_err = ""
 
         if datos.get("geometria"):
             try:
@@ -2222,6 +2439,8 @@ class App:
         tk.Label(marco, text="Doble clic en un número para editarlo  ·  «Nueva partida» la guarda en el "
                              "historial (se hace sola al volver al lobby)", font=("Segoe UI", 8),
                  fg=APAGADO, bg=CARD, wraplength=400, justify="center").pack(pady=(2, 0))
+        self.boton_texto(marco, "↶ Deshacer el cierre de la última partida", self.deshacer_partida,
+                         bg=CARD, fg=ORO).pack(pady=(0, 0))
 
         # --- pestañas: Amigos / En pantalla / Ajustes ---
         self.barra_tabs = tk.Frame(marco, bg=CARD)
@@ -2232,7 +2451,8 @@ class App:
         self.zona.grid_columnconfigure(0, weight=1)
         self.tabs = {}
         self.btn_tabs = {}
-        for clave, texto in (("amigos", "👥 Amigos"), ("pantalla", "🖥 En pantalla"), ("ajustes", "⚙ Ajustes")):
+        for clave, texto in (("amigos", "👥 Amigos"), ("pantalla", "🖥 En pantalla"), ("ajustes", "⚙ Ajustes"),
+                             ("mas", "⋯ Más")):
             fr = tk.Frame(self.zona, bg=PANEL)
             self.tabs[clave] = fr
             b = tk.Button(self.barra_tabs, text=texto, command=lambda c=clave: self.mostrar_pestana(c),
@@ -2242,6 +2462,7 @@ class App:
         self.construir_amigos(self.tabs["amigos"])
         self.construir_pantalla(self.tabs["pantalla"])
         self.construir_ajustes(self.tabs["ajustes"])
+        self.construir_mas(self.tabs["mas"])
 
         # --- estado ---
         self.lbl_estado = tk.Label(marco, text="Iniciando...", font=("Segoe UI", 8), fg=APAGADO,
@@ -2354,6 +2575,9 @@ class App:
         self.var_lobby = tk.BooleanVar(value=self.ini_lobby)
         self.var_solo_cofre = tk.BooleanVar(value=self.ini_solo)
         self.var_fotos = tk.BooleanVar(value=self.ini_fotos)
+        self.var_obs = tk.BooleanVar(value=self.ini_obs)
+        self.var_inicio = tk.BooleanVar(value=inicio_windows_activo())
+        self.var_zona = tk.StringVar(value=nombre_zona())
         self.var_pantalla = tk.StringVar(
             value=self.ini_pantalla if self.ini_pantalla in opciones_pantalla else "Auto")
         self.var_sonido = tk.StringVar(value=self.cfg_son["elegido"])
@@ -2387,6 +2611,24 @@ class App:
         self.rejilla_chips(caja, [("🔔  Sonar al sumar", self.var_pitido, self.guardar),
                                   ("🎉  Celebrar hitos", self.var_celebrar, self.guardar)], columnas=2)
 
+    def construir_mas(self, fj):
+        caja = tk.Frame(fj, bg=PANEL)
+        caja.pack(fill="x", padx=14, pady=(2, 8))
+
+        # --- hora y sistema ---
+        self.titulo_seccion(caja, "HORA Y SISTEMA")
+        f = tk.Frame(caja, bg=PANEL)
+        f.pack(fill="x")
+        tk.Label(f, text="Zona horaria", font=("Segoe UI", 9), fg=TEXTO, bg=PANEL).pack(side="left")
+        self.menu_opciones(f, self.var_zona, OPCIONES_ZONA, self.al_cambiar_zona).pack(side="left", padx=6)
+        self.rejilla_chips(caja, [("🚀  Iniciar con Windows", self.var_inicio, self.al_cambiar_inicio),
+                                  ("📺  Archivos para OBS", self.var_obs, self.al_cambiar_obs)], columnas=2)
+        tk.Label(caja, text="La zona horaria decide dónde acaba cada día en las estadísticas. «Archivos para OBS» "
+                            "escribe obs_total.txt y obs_partida.txt en tu carpeta de datos: en OBS añade una "
+                            "fuente «Texto» y marca «Leer desde archivo».",
+                 font=("Segoe UI", 8), fg=APAGADO, bg=PANEL, wraplength=370, justify="left",
+                 anchor="w").pack(fill="x", pady=(2, 0))
+
         # --- atajos y datos ---
         self.titulo_seccion(caja, "ATAJOS Y DATOS")
         f = tk.Frame(caja, bg=PANEL)
@@ -2413,6 +2655,45 @@ class App:
             os.startfile(DATOS)
         except Exception:
             messagebox.showinfo("Datos", "Tus datos están en:\n\n%s" % DATOS, parent=self.root)
+
+    # ---------- zona horaria, inicio con Windows y archivos para OBS ----------
+    def al_cambiar_zona(self, valor=None):
+        poner_zona(self.var_zona.get())
+        self._st = None
+        self._st_clave = None
+        self._res_clave = None
+        self.pintar_resumen()
+        if self.stats is not None and self.stats.vivo():
+            self.stats.refrescar(True)
+        self.guardar()
+
+    def al_cambiar_inicio(self):
+        if not poner_inicio_windows(self.var_inicio.get()):
+            self.var_inicio.set(not self.var_inicio.get())
+            messagebox.showerror("Iniciar con Windows", "No se pudo cambiar el inicio automático.",
+                                 parent=self.root)
+
+    def al_cambiar_obs(self):
+        self._obs_clave = None
+        if self.var_obs.get():
+            self.escribir_obs()
+            self.aviso("Archivos para OBS en la carpeta de datos (botón «📁 Datos»).")
+        self.guardar()
+
+    def escribir_obs(self):
+        """obs_total.txt y obs_partida.txt: un número cada uno, para usarlos como fuente de texto en OBS."""
+        if not self.var_obs.get():
+            return
+        clave = (self.total, self.sesion)
+        if clave == self._obs_clave:
+            return
+        self._obs_clave = clave
+        for nombre, valor in (("obs_total.txt", self.total), ("obs_partida.txt", self.sesion)):
+            try:
+                with open(os.path.join(DATOS, nombre), "w", encoding="utf-8") as f:
+                    f.write(str(valor))
+            except OSError:
+                pass
 
     # ---------- sonido del cofre ----------
     def ruta_personal(self):
@@ -2489,7 +2770,7 @@ class App:
     # ---------- estadísticas ----------
     def estadisticas(self):
         ahora = time.time()
-        clave = (self.hist.version, fecha_madrid(ahora))
+        clave = (self.hist.version, fecha_madrid(ahora), nombre_zona())
         if clave != self._st_clave or self._st is None:
             self._st = calcular_stats(self.hist.partidas, self.hist.actual, ahora)
             self._st_clave = clave
@@ -3036,6 +3317,8 @@ class App:
         return self.sesion + sum(a["partida"] for a in st["amigos"] if a["online"])
 
     def dialogo_conexion(self):
+        """Ventana sencilla: tu nombre, el nombre de la sala y dos botones (crear / unirse).
+        La base de datos ya viene dentro del programa."""
         if self.dlg is not None and self.dlg.winfo_exists():
             self.dlg.lift()
             return
@@ -3051,87 +3334,131 @@ class App:
         caja = tk.Frame(d, bg=CARD, highlightbackground=ORO, highlightthickness=2)
         caja.pack(padx=8, pady=8)
         tk.Label(caja, text="Conectar con tus amigos", font=("Segoe UI Semibold", 13), fg=ORO,
-                 bg=CARD).pack(padx=20, pady=(12, 2))
-        tk.Label(caja, text="Todos ponéis la misma dirección y el mismo código de sala.\n"
-                            "Quien entre primero en la sala es el líder.",
+                 bg=CARD).pack(padx=30, pady=(12, 2))
+        tk.Label(caja, text="Crea una sala nueva o únete a la de un amigo.\n"
+                            "Quien crea la sala es el líder.",
                  font=("Segoe UI", 8), fg=APAGADO, bg=CARD, justify="center").pack()
 
-        def campo(texto, valor, ancho):
-            tk.Label(caja, text=texto, font=("Segoe UI", 9), fg=TEXTO, bg=CARD).pack(anchor="w", padx=20, pady=(8, 0))
-            var = tk.StringVar(value=valor)
-            e = tk.Entry(caja, textvariable=var, font=("Segoe UI", 11), width=ancho, bg=BG, fg=ORO,
-                         insertbackground=ORO, relief="flat", highlightthickness=2,
-                         highlightbackground=APAGADO, highlightcolor=ORO)
-            e.pack(padx=20, pady=(2, 0))
-            return var
+        def estilo_entrada(e):
+            e.config(font=("Segoe UI", 11), bg=BG, fg=ORO, insertbackground=ORO, relief="flat",
+                     highlightthickness=2, highlightbackground=APAGADO, highlightcolor=ORO)
 
-        v_nombre = campo("Tu nombre (así te verán tus amigos)", self.cfg_on.get("nombre", ""), 40)
-        v_url = campo("Dirección de la base de datos (Firebase)", self.cfg_on.get("url", ""), 40)
-        v_sala = campo("Código de sala (inventa uno, igual para todos)", self.cfg_on.get("sala", ""), 40)
-        v_act = tk.BooleanVar(value=bool(self.cfg_on.get("activo", False)))
-        self.check(caja, "Conexión activada", v_act, color=TEXTO, bg=CARD).pack(anchor="w", padx=16, pady=(8, 0))
-        aviso = tk.Label(caja, text="Tip: si alguien te pasa una «invitación», pégala en la dirección.",
+        tk.Label(caja, text="Tu nombre (así te verán tus amigos)", font=("Segoe UI", 9), fg=TEXTO,
+                 bg=CARD).pack(anchor="w", padx=20, pady=(8, 0))
+        v_nombre = tk.StringVar(value=self.cfg_on.get("nombre", ""))
+        e_nombre = tk.Entry(caja, textvariable=v_nombre, width=36)
+        estilo_entrada(e_nombre)
+        e_nombre.pack(padx=20, pady=(2, 0))
+
+        tk.Label(caja, text="Nombre de la sala", font=("Segoe UI", 9), fg=TEXTO,
+                 bg=CARD).pack(anchor="w", padx=20, pady=(8, 0))
+        fila_cod = tk.Frame(caja, bg=CARD)
+        fila_cod.pack(padx=20, pady=(2, 0), fill="x")
+        v_sala = tk.StringVar(value=self.cfg_on.get("sala") or "cofres")
+        e_sala = tk.Entry(fila_cod, textvariable=v_sala, width=30)
+        estilo_entrada(e_sala)
+        e_sala.pack(side="left")
+        b_copiar = tk.Button(fila_cod, text="📋", bg=PANEL, fg=ORO, activebackground="#40377a",
+                             activeforeground=ORO, relief="flat", bd=0, cursor="hand2",
+                             font=("Segoe UI Emoji", 12), padx=6)
+        b_copiar.pack(side="left", padx=(6, 0), fill="y")
+
+        aviso = tk.Label(caja, text="Crear: inventa un nombre y pásaselo a tus amigos (el icono 📋 lo copia).\n"
+                                    "Unirse: escribe el nombre que te haya dado quien creó la sala.",
                          font=("Segoe UI", 8), fg=APAGADO, bg=CARD, wraplength=330, justify="left")
-        aviso.pack(padx=20, pady=(6, 0))
+        aviso.pack(padx=20, pady=(8, 0))
 
-        def leer():
-            url_txt = v_url.get().strip()
-            sala_txt = v_sala.get()
-            if "|" in url_txt:                      # invitación completa: dirección|sala
-                url_txt, extra = url_txt.split("|", 1)
-                if extra.strip():
-                    sala_txt = extra
-            return limpiar_url(url_txt), limpiar_sala(sala_txt)
-
-        def guardar_conexion():
-            url, sala = leer()
-            activo = bool(v_act.get())
-            if activo and (not url or not sala):
-                aviso.config(text="Para activarlo hace falta la dirección y el código de sala.", fg=ROJO)
-                return
-            # si cambias de sala, te quitas de la anterior (para no dejar un "fantasma" tuyo allí)
-            antes = (self.cfg_on.get("url", ""), self.cfg_on.get("sala", ""))
-            if self.cfg_on.get("activo") and antes[0] and antes[1] and antes != (url, sala):
-                Sincronizador.borrar_entrada(antes[0], antes[1], self.cfg_on.get("id", ""))
-            self.cfg_on["nombre"] = v_nombre.get().strip()[:20] or nombre_por_defecto()
-            self.cfg_on["url"] = url
-            self.cfg_on["sala"] = sala
-            self.cfg_on["activo"] = activo
-            self.aplicar_conexion()
-            self.guardar()
-            self.pintar_amigo(forzar=True)
-            d.destroy()
-
-        def copiar_invitacion():
-            url, sala = leer()
-            if not url or not sala:
-                aviso.config(text="Primero rellena la dirección y el código de sala.", fg=ROJO)
+        def copiar():
+            s = limpiar_sala(v_sala.get())
+            if not s:
+                aviso.config(text="Escribe primero el nombre de la sala.", fg=ROJO)
                 return
             self.root.clipboard_clear()
-            self.root.clipboard_append("%s|%s" % (url, sala))
+            self.root.clipboard_append(s)
             self.root.update()
-            aviso.config(text="Invitación copiada. Pásasela a tus amigos: la pegan en «Dirección».", fg=VERDE)
+            aviso.config(text="Nombre de sala «%s» copiado. Pégaselo a tus amigos." % s, fg=VERDE)
+
+        b_copiar.config(command=copiar)
+
+        def lanzar(modo):
+            sala = limpiar_sala(v_sala.get())
+            nombre = v_nombre.get().strip()[:20] or nombre_por_defecto()
+            if not sala:
+                aviso.config(text="Escribe el nombre de la sala (letras, números, - o _).", fg=ROJO)
+                return
+            v_sala.set(sala)
+            if self.cfg_on.get("activo") and self.cfg_on.get("sala") == sala:
+                self.entrar_en_sala(nombre, sala, "ya")          # ya estás dentro: solo se cambia el nombre
+                d.destroy()
+                return
+            b_crear.config(state="disabled")
+            b_unir.config(state="disabled")
+            aviso.config(text="Comprobando la sala...", fg=ORO)
+            res = {"r": None}
+            pid = self.cfg_on.get("id", "")
+
+            def tarea():
+                res["r"] = preparar_sala(modo, sala, pid)
+
+            def esperar():
+                try:
+                    if res["r"] is None:
+                        d.after(120, esperar)
+                        return
+                    ok, msg = res["r"]
+                    if not ok:
+                        aviso.config(text=msg, fg=ROJO)
+                        b_crear.config(state="normal")
+                        b_unir.config(state="normal")
+                        return
+                    self.entrar_en_sala(nombre, sala, modo)
+                    d.destroy()
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=tarea, daemon=True).start()
+            esperar()
 
         fila = tk.Frame(caja, bg=CARD)
         fila.pack(pady=12)
-        self.boton(fila, "Guardar", guardar_conexion, "#2e9e5b", 8).pack(side="left", padx=4)
-        self.boton(fila, "Copiar invitación", copiar_invitacion, MORADO, 15).pack(side="left", padx=4)
+        b_crear = self.boton(fila, "Crear sala", lambda: lanzar("crear"), "#2e9e5b", 11)
+        b_crear.pack(side="left", padx=4)
+        b_unir = self.boton(fila, "Unirse a sala", lambda: lanzar("unirse"), MORADO, 13)
+        b_unir.pack(side="left", padx=4)
         self.boton(fila, "Cancelar", d.destroy, "#4a4468", 8).pack(side="left", padx=4)
         d.bind("<Escape>", lambda ev: d.destroy())
+
+    def entrar_en_sala(self, nombre, sala, modo):
+        c = self.cfg_on
+        antes = c.get("sala", "")
+        # si cambias de sala, te quitas de la anterior (para no dejar un "fantasma" tuyo allí)
+        if c.get("activo") and antes and antes != sala:
+            Sincronizador.borrar_entrada(URL_SALAS, antes, c.get("id", ""))
+        c["nombre"] = nombre
+        c["url"] = URL_SALAS
+        c["sala"] = sala
+        c["activo"] = True
+        self.aplicar_conexion()
+        self.guardar()
+        self.pintar_amigo(forzar=True)
+        if modo == "crear":
+            self.aviso("Sala «%s» creada. Pásales ese nombre a tus amigos (en «⚙ Conectar» está el icono 📋)." % sala, 15)
+        elif modo == "unirse":
+            self.aviso("Te has unido a la sala «%s»." % sala)
 
     def salir_de_sala(self):
         """Te saca de la sala en la que estás: te quita de ella, desconecta y deja libre el código
         para que pongas otro."""
         c = self.cfg_on
-        sala, url = c.get("sala", ""), c.get("url", "")
+        sala = c.get("sala", "")
         if not (c.get("activo") and sala):
             return
         if not messagebox.askyesno(
                 "Salir de la sala",
                 "¿Salir de la sala «%s»?\n\nDejarás de ver a los demás y ellos dejarán de verte.\n"
-                "Después podrás entrar en otra (o volver a esta) con «⚙ Conectar»." % sala, parent=self.root):
+                "Después podrás crear otra o unirte a una con «⚙ Conectar»." % sala, parent=self.root):
             return
-        Sincronizador.borrar_entrada(url, sala, c.get("id", ""))
+        Sincronizador.borrar_entrada(URL_SALAS, sala, c.get("id", ""))
         c["activo"] = False
         c["sala"] = ""
         self.aplicar_conexion()
@@ -3141,7 +3468,7 @@ class App:
 
     def aplicar_conexion(self):
         c = self.cfg_on
-        self.sync.configurar(c.get("url", ""), c.get("sala", ""), c.get("id", ""), c.get("activo", False))
+        self.sync.configurar(URL_SALAS, c.get("sala", ""), c.get("id", ""), c.get("activo", False))
         self.sync.publicar(c.get("nombre", ""), self.total, self.sesion)
 
     def amigos_overlay(self):
@@ -3195,11 +3522,11 @@ class App:
                      fg=APAGADO, bg=PANEL, anchor="w").pack(fill="x", pady=2)
 
         if nivel == "off":
-            msg, col = "Sin conectar. Pulsa «⚙ Conectar» para configurarlo.", APAGADO
+            msg, col = "Sin conectar. Pulsa «⚙ Conectar» para crear una sala o unirte a la de un amigo.", APAGADO
         elif nivel == "trabajando":
             msg, col = "Conectando...", APAGADO
         elif st["expulsado"]:
-            msg, col = "El líder te ha expulsado de esta sala. Usa otro código de sala para entrar en otra.", ROJO
+            msg, col = "El líder te ha expulsado de esta sala. Crea otra o únete a una distinta con «⚙ Conectar».", ROJO
         elif nivel == "error":
             msg, col = st["texto"], ROJO
         else:
@@ -3350,6 +3677,7 @@ class App:
             self.revisar_resultado_actualizacion()
             self.pintar_ritmo()
             self.revisar_novedades()
+            self.escribir_obs()
             if self.stats is not None:
                 if self.stats.vivo():
                     self.stats.refrescar()
@@ -3545,6 +3873,8 @@ class App:
         datos["pantalla"] = self.var_pantalla.get()
         datos["solo_cofre"] = bool(self.var_solo_cofre.get())
         datos["fotos"] = bool(self.var_fotos.get())
+        datos["obs"] = bool(self.var_obs.get())
+        datos["zona"] = nombre_zona()
         self.cfg_sucio = False
         self.error_guardado = not guardar_json(ARCHIVO, datos)
 
@@ -3602,6 +3932,8 @@ class App:
                 self.hist.quitar()
         self.pintar_resumen()
         self.sync.publicar(self.cfg_on.get("nombre", ""), self.total, self.sesion)
+        if n > 0 and not automatico:
+            self.guardar_fallo()
 
     def nueva_partida(self, auto=False):
         """Guarda la partida en el historial y pone a 0 solo el contador de la partida;
@@ -3613,7 +3945,10 @@ class App:
             resumen = "Partida: %d cofres en %s" % (len(ev), hms(dur))
             if len(ev) >= 2 and dur >= 60:
                 resumen += " (%s/hora)" % f1(len(ev) * 3600.0 / dur)
+        sesion_antes = self.sesion
         guardada = self.hist.cerrar()
+        if guardada:
+            self.sesion_previa = sesion_antes
         self.sesion = 0
         self.lbl_sesion.config(text="0")
         self.activo = False
@@ -3626,6 +3961,30 @@ class App:
             self.aviso(("Lobby detectado. " if auto else "") + resumen + " · guardada.", 20)
         elif auto:
             self.aviso("Lobby detectado: nueva partida.")
+
+    def deshacer_partida(self):
+        """Reabre la última partida guardada (por si se cerró sin querer o el lobby se detectó mal)."""
+        if not self.hist.partidas:
+            messagebox.showinfo("Deshacer", "No hay ninguna partida guardada que reabrir.", parent=self.root)
+            return
+        ult = self.hist.partidas[-1]
+        if not messagebox.askyesno(
+                "Deshacer",
+                "¿Reabrir la última partida guardada (%d cofres)?\n\nSus cofres volverán a la partida en curso."
+                % len(ult), parent=self.root):
+            return
+        if not self.hist.deshacer_cierre():
+            return
+        previa = self.sesion_previa if self.sesion_previa is not None else len(ult)
+        self.sesion_previa = None
+        self.sesion = min(MAX_NUMERO, previa + self.sesion)
+        self.lbl_sesion.config(text=str(self.sesion))
+        self._st = None
+        self._res_clave = None
+        self.pintar_resumen()
+        self.refrescar_overlay()
+        self.sync.publicar(self.cfg_on.get("nombre", ""), self.total, self.sesion)
+        self.aviso("Partida reabierta: ahora lleva %d cofres." % len(self.hist.actual))
 
     # ---------- captura ----------
     def region_juego(self):
@@ -3718,9 +4077,33 @@ class App:
                     self.en_lobby = False
                     self.lobby_no = 0
 
+    def guardar_fallo(self):
+        # Si sumas un cofre a mano (porque no te lo contó), guarda lo que veía el programa justo antes.
+        if not self.var_fotos.get() or not self.frames_recientes:
+            return
+        frames = list(self.frames_recientes)
+        marca = time.strftime("%Y%m%d_%H%M%S")
+
+        def tarea():
+            try:
+                carpeta = os.path.join(CARPETA_FALLOS, marca)
+                os.makedirs(carpeta, exist_ok=True)
+                t0 = frames[-1][0]
+                for i, (t, img) in enumerate(frames):
+                    img.save(os.path.join(carpeta, "%d_hace_%.1fs.png" % (i, t0 - t)))
+                viejas = sorted(os.listdir(CARPETA_FALLOS))
+                for d in viejas[:-4]:
+                    shutil.rmtree(os.path.join(CARPETA_FALLOS, d), ignore_errors=True)
+            except Exception:
+                pass
+
+        threading.Thread(target=tarea, daemon=True).start()
+
     def borrar_fotos(self):
+        self.frames_recientes.clear()
         try:
             shutil.rmtree(CARPETA_DETECCIONES, ignore_errors=True)
+            shutil.rmtree(CARPETA_FALLOS, ignore_errors=True)
         except Exception:
             pass
 
@@ -3776,6 +4159,14 @@ class App:
 
         threading.Thread(target=tarea, daemon=True).start()
 
+    def enfriar_sube(self):
+        # Un aviso que parpadea (se pierde 1-2 fotogramas por la animación) no reinicia la cuenta.
+        if self.sube > 0:
+            self.sube_hueco += 1
+            if self.sube_hueco > 2:
+                self.sube = 0
+                self.sube_hueco = 0
+
     def procesar(self, n, origen=""):
         """n = cuántos avisos de cofre se ven ahora mismo. Se cuenta un cofre cada vez que n
         SUBE respecto a los ya contados (así, si coges otro cofre mientras el anterior sigue en
@@ -3784,6 +4175,7 @@ class App:
         conf = self.avisos_conf
         if n > conf:
             self.baja = 0
+            self.sube_hueco = 0
             if n == self.cand_n:
                 self.sube += 1
             else:
@@ -3797,13 +4189,13 @@ class App:
                     self.sumar(1, True)
                 self.guardar_deteccion(nuevos, origen)
         elif n < conf:
-            self.sube = 0
+            self.enfriar_sube()
             self.baja += 1
             if self.baja >= FRAMES_PARA_REARMAR:
                 self.avisos_conf = n
                 self.baja = 0
         else:
-            self.sube = 0
+            self.enfriar_sube()
             self.baja = 0
 
     def poner_estado(self, msg):
@@ -3836,6 +4228,9 @@ class App:
                 pequena, grande, vieja = self.capturar(rect)
                 self.ultima_img = grande
                 self.ultima_rect = rect
+                if self.var_fotos.get() and time.time() - self.t_frame > 0.5:
+                    self.t_frame = time.time()
+                    self.frames_recientes.append((self.t_frame, grande))
                 todos = buscar_avisos(pequena)
                 solo = bool(self.var_solo_cofre.get())
                 # con "solo COFRE" (lo normal) la experiencia de la partida y demás avisos se ignoran
@@ -3874,6 +4269,14 @@ class App:
                                         % (n_av, det, "SÍ" if ok_v else "no", v1, v2, vw,
                                            int(self.lobby_info[0] * 100), int(self.lobby_info[1] * 100), ms))
         except Exception as e:
+            msg_err = "%s: %s" % (type(e).__name__, e)
+            if msg_err != self._ult_err:          # se apunta una vez, no 12 veces por segundo
+                self._ult_err = msg_err
+                try:
+                    import traceback
+                    registrar_error("tick: " + " | ".join(traceback.format_exc().strip().splitlines()[-3:]))
+                except Exception:
+                    pass
             self.lbl_estado.config(text="Error: %s" % e)
         self.root.after(INTERVALO_MS, self.tick)
 

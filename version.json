@@ -1,7 +1,7 @@
 {
-  "version": "1.2.2",
+  "version": "1.3.1",
   "archivo": "contador_cofres.py",
-  "sha256": "396d5d28082c454e39dbbdbb50c8fa8614f2bb590f9fd25548952c614cb887bb",
+  "sha256": "a1ffcfe8ee325a0d1d4e804d8af5cc61f4b2dc1a414f14a06a46e9407d8d79ac",
   "obligatoria": true,
-  "notas": "Ya no se guardan fotos en tu PC (se borran solas al abrir). Si quieres activarlas, está en Ajustes."
+  "notas": "Mejor funcionamiento para crear/unirse a salas, boton para deshacer los datos de la ultima partida, configuracion de Zona Horaria y Archivos para OBS."
 }
