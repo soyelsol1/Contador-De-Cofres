@@ -1253,6 +1253,158 @@ def buscar_avisos(img, depurar=False):
     return avisos
 
 
+# --- aviso APILADO: cuando abres varios cofres seguidos el juego los junta en una sola lista ------
+#       +5750 PE
+#       COFRE RARO
+#       ESPÍRITU AL MÁXIMO
+#       COFRE DE ESPÍRITU
+#       COFRE RARO X3          <- «X3» = tres cofres de ese tipo
+#       MUNICIÓN MÁXIMA
+# Se cuentan las líneas que EMPIEZAN por «COFRE» (sumando el multiplicador «X3», «X2»...) y se
+# ignoran las demás (munición, espíritu...).
+DIG_W, DIG_H = 10, 14
+_DIGITOS_PLANT = []
+
+
+def _plantillas_digitos():
+    """Dígitos 2-9 dibujados con una fuente gruesa de Windows (cursiva y recta), para reconocer
+    el número del «X3». Si no hay fuente disponible, devuelve vacío y se asume «X2»."""
+    if _DIGITOS_PLANT:
+        return _DIGITOS_PLANT[0]
+    res = {}
+    try:
+        from PIL import ImageFont
+        fuentes = []
+        for nombre in ("arialbi.ttf", "arialbd.ttf"):
+            try:
+                fuentes.append(ImageFont.truetype(nombre, 48))
+            except Exception:
+                continue
+        for d in range(2, 10):
+            variantes = []
+            for fu in fuentes:
+                im = Image.new("L", (72, 80), 0)
+                ImageDraw.Draw(im).text((12, 8), str(d), font=fu, fill=255)
+                bb = im.getbbox()
+                if bb:
+                    variantes.append(list(im.crop(bb).resize((DIG_W, DIG_H), Image.BILINEAR).tobytes()))
+            if variantes:
+                res[d] = variantes
+    except Exception:
+        res = {}
+    _DIGITOS_PLANT.append(res)
+    return res
+
+
+def _ncc_listas(a, b):
+    n = len(a)
+    ma = sum(a) / float(n)
+    mb = sum(b) / float(n)
+    va = sum(map(mul, a, a)) / float(n) - ma * ma
+    vb = sum(map(mul, b, b)) / float(n) - mb * mb
+    if va <= 1e-6 or vb <= 1e-6:
+        return 0.0
+    return (sum(map(mul, a, b)) / float(n) - ma * mb) / math.sqrt(va * vb)
+
+
+def _leer_digito(m, x0, x1, y0, y1):
+    """Reconoce el dígito (2-9) que hay en ese rectángulo de la máscara. None si no se fía."""
+    plant = _plantillas_digitos()
+    if not plant:
+        return None
+    c = m.crop((max(0, x0), y0, x1 + 1, y1 + 1))
+    bb = c.getbbox()
+    if not bb:
+        return None
+    v = list(c.crop(bb).resize((DIG_W, DIG_H), Image.BILINEAR).tobytes())
+    mejor, mejor_d = 0.0, None
+    for d, variantes in plant.items():
+        for t in variantes:
+            s = _ncc_listas(v, t)
+            if s > mejor:
+                mejor, mejor_d = s, d
+    return mejor_d if mejor >= 0.45 else None
+
+
+def _multiplicador_linea(m, B):
+    """1 si la línea no lleva «X3» al final; si lo lleva, el número (2 si no se puede leer)."""
+    w = m.size[0]
+    bh = B["h"]
+    bd = m.crop((0, B["y0"], w, B["y1"] + 1)).transpose(Image.TRANSPOSE).tobytes()
+    cuenta = [bd[x * bh:(x + 1) * bh].count(255) for x in range(w)]
+    palabras = _tramos([c > 0 for c in cuenta], max(2, int(bh * 0.28)))
+    if len(palabras) < 2:
+        return 1
+    ini, fin = palabras[-1]
+    ancho = fin - ini + 1
+    if ancho > 2.2 * bh or ancho < 0.8 * bh:
+        return 1                         # la última palabra es una palabra normal, no «X3»
+    glifos = _tramos([c > 0 for c in cuenta[ini:fin + 1]], 0)
+    if len(glifos) >= 2:
+        gi, gf = glifos[-1]
+        x0, x1 = ini + gi, ini + gf
+    else:
+        x0, x1 = ini + int(ancho * 0.5), fin
+    d = _leer_digito(m, x0, x1, B["y0"], B["y1"])
+    return d if d and d >= 2 else 2
+
+
+def buscar_lista_cofres(img):
+    """Aviso apilado de varios cofres. Devuelve None si no hay ninguna línea «COFRE...»; si la hay:
+    {"n": cofres en total, "lineas": líneas de cofre, "activo": True si es un aviso apilado de verdad}."""
+    m = mascara_aviso(img)
+    bandas = _bandas_mascara(m)
+    if len(bandas) < 2:
+        return None
+    cab = None
+    lineas = []
+    for i, A in enumerate(bandas):
+        wa = A["cmax"] - A["cmin"] + 1
+        if not (8 <= A["h"] <= 34 and A["n"] >= 40 and A["tramos"] >= 3 and 20 <= wa <= 220):
+            continue
+        cand = []
+        prev = A
+        for B in bandas[i + 1:]:
+            if B["y0"] - prev["y1"] - 1 > 12:
+                break
+            wb = B["cmax"] - B["cmin"] + 1
+            if 5 <= B["h"] <= 30 and B["n"] >= 40 and 20 <= wb <= 330 and abs(B["cmin"] - A["cmin"]) <= 70:
+                cand.append(B)
+            prev = B
+        if cand:
+            cab, lineas = A, cand
+            break
+    if cab is None:
+        return None
+    F = None
+    cofres = 0
+    n_lineas = 0
+    for B in lineas:
+        if F is None:
+            gris = img.convert("L").point(_L_CONTRASTE)
+            F = ImageChops.multiply(gris, m.filter(ImageFilter.MaxFilter(7)).point(_L_BIN))
+        clave = ("L", B["y0"], B["cmin"], B["cmax"], B["n"] // 15)
+        ahora = time.time()
+        c = _CACHE_COFRE.get(clave)
+        if c is not None and ahora - c[0] < 1.0:
+            sc = c[1]
+        else:
+            # «COFRE» puede estar en CUALQUIER punto de la línea (al principio, en medio o al final)
+            if B["cmax"] - B["cmin"] + 1 < PLANTILLA_COFRE_TAM[0] - 6:
+                sc = 0.0                  # demasiado corta para contener la palabra
+            else:
+                sc = puntuacion_cofre(F, B["cmin"] - 2, B["y0"], B["cmax"])
+            if len(_CACHE_COFRE) > 60:
+                _CACHE_COFRE.clear()
+            _CACHE_COFRE[clave] = (ahora, sc)
+        if sc >= UMBRAL_COFRE:
+            n_lineas += 1
+            cofres += _multiplicador_linea(m, B)
+    if n_lineas == 0:
+        return None
+    return {"n": cofres, "lineas": n_lineas, "activo": (len(lineas) >= 2 or cofres > n_lineas)}
+
+
 def hay_aviso_clasico(img):
     """El detector de siempre: el aviso morado de dos líneas, '+600 PE' arriba y la palabra corta
     'COFRE' debajo. Se mantiene tal cual funcionaba, como red de seguridad del detector nuevo."""
@@ -2239,6 +2391,8 @@ class App:
         self.avisos_conf = 0      # cuántos avisos de cofre damos por "ya contados" ahora mismo
         self.cand_n = 0
         self.sube_hueco = 0
+        self.lista_max = 0        # máximo de cofres vistos en el aviso apilado que sigue en pantalla
+        self.lista_cero = 0       # fotogramas seguidos sin aviso apilado
         self.frames_recientes = deque(maxlen=8)
         self.t_frame = 0.0
         self.sube = 0
@@ -4182,7 +4336,7 @@ class App:
                 self.cand_n = n
                 self.sube = 1
             if self.sube >= FRAMES_PARA_CONTAR:
-                nuevos = min(n - conf, 4)
+                nuevos = min(n - conf, 8)
                 self.avisos_conf = n
                 self.sube = 0
                 for _ in range(nuevos):
@@ -4221,6 +4375,8 @@ class App:
                 self.lobby_si = 0
                 self.avisos_conf = 0
                 self.sube = self.baja = 0
+                self.lista_max = 0
+                self.lista_cero = 0
             else:
                 self.tick_n += 1
                 if self.tick_n % LOBBY_CADA == 0:
@@ -4245,6 +4401,28 @@ class App:
                 if ok_v and n_av == 0 and not (solo and otros):
                     n_av = 1
                     origen = "clasico"
+                # Aviso APILADO (varios cofres abiertos seguidos: una lista bajo un solo «+N PE»).
+                # Si lo hay, manda: se cuentan las líneas «COFRE...» y sus multiplicadores («X3»).
+                try:
+                    lista = buscar_lista_cofres(pequena)
+                except Exception:
+                    lista = None
+                if lista and lista["activo"]:
+                    n_av = lista["n"]
+                    origen = "lista"
+                    otros = []
+                    self.lista_cero = 0
+                    # mientras la lista siga en pantalla la cuenta solo sube (si un número se lee
+                    # mal un instante, no se cuenta dos veces)
+                    self.lista_max = max(self.lista_max, n_av)
+                    n_av = self.lista_max
+                else:
+                    self.lista_cero += 1
+                    if self.lista_cero >= 2:
+                        self.lista_max = 0
+                    elif self.lista_max > 0:
+                        n_av = max(n_av, self.lista_max)
+                        origen = "lista"
                 if self.en_lobby:       # en el lobby no sale ningún aviso de cofre
                     avisos = []
                     otros = []
@@ -4265,8 +4443,9 @@ class App:
                 a = self.ultimo_aviso
                 det = ("aviso: parece COFRE %d%%" % int(a["cofre"] * 100)) if a else "sin aviso"
                 ms = int((time.time() - t_ini) * 1000)
-                self.lbl_detalle.config(text="Avisos: %d (%s · clásico %s l1=%d l2=%d ancho=%d)  ·  Lobby: botón=%d%% menú=%d%%  ·  ciclo %d ms"
+                self.lbl_detalle.config(text="Avisos: %d (%s · clásico %s l1=%d l2=%d ancho=%d)  ·  Lista: %s  ·  Lobby: botón=%d%% menú=%d%%  ·  ciclo %d ms"
                                         % (n_av, det, "SÍ" if ok_v else "no", v1, v2, vw,
+                                           ("%d cofres" % lista["n"]) if lista else "no",
                                            int(self.lobby_info[0] * 100), int(self.lobby_info[1] * 100), ms))
         except Exception as e:
             msg_err = "%s: %s" % (type(e).__name__, e)
