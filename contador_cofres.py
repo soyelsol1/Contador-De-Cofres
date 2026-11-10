@@ -110,7 +110,7 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 # Base de datos de las salas: la misma para todo el mundo, ya viene dentro del programa.
 URL_SALAS = "https://cofres-7beb6-default-rtdb.europe-west1.firebasedatabase.app"
@@ -1461,6 +1461,87 @@ def hay_lobby(img_boton, img_pastilla):
     return (fa >= 0.65 and fp >= 0.50), fa, fp
 
 
+# --- detector de lobby TOLERANTE ------------------------------------------------------------
+# El de arriba mira dos cajas en posiciones fijas. Falla si el botón amarillo lleva un texto largo
+# («TODO LISTO» cuando estás en grupo), si la pantalla no es 16:9, o si la ventana del propio
+# programa tapa esa zona. Este busca los elementos por la pantalla entera, sin posiciones fijas.
+_RE_RUN = re.compile(b"\xff+")
+_L_G185 = _lut(lambda v: v > 185)
+_L_G215 = _lut(lambda v: v > 215)
+_L_B90 = _lut(lambda v: v < 90)
+_L_D35 = _lut(lambda v: v < 35)
+
+
+def _mask_amarillo(img):
+    r, g, b = img.split()
+    mul_ = ImageChops.multiply
+    return mul_(mul_(r.point(_L_G215), g.point(_L_G215)), b.point(_L_B90))
+
+
+def _mask_claro(img, lut):
+    """Píxeles claros y sin color (blanco / gris claro)."""
+    r, g, b = img.split()
+    mul_ = ImageChops.multiply
+    claro = mul_(mul_(r.point(lut), g.point(lut)), b.point(lut))
+    gris = mul_(mul_(ImageChops.difference(r, g).point(_L_D35), ImageChops.difference(g, b).point(_L_D35)),
+                ImageChops.difference(r, b).point(_L_D35))
+    return mul_(claro, gris)
+
+
+def _filas_largas(mask, x0, y0, x1, y1, min_run):
+    """Por cada fila, la tira continua más larga de píxeles encendidos (si mide al menos min_run)."""
+    w = mask.size[0]
+    d = mask.tobytes()
+    out = []
+    for y in range(y0, y1):
+        fila = d[y * w + x0:y * w + x1]
+        mejor = None
+        for m in _RE_RUN.finditer(fila):
+            n = m.end() - m.start()
+            if n >= min_run and (mejor is None or n > mejor[1]):
+                mejor = (m.start(), n)
+        if mejor:
+            out.append((y, mejor[0], mejor[1]))
+    return out
+
+
+def _hay_bloque(filas, min_filas, ventana, tol=6):
+    """¿Hay al menos min_filas filas parecidas (mismo inicio y largo) dentro de una ventana vertical?
+    Así un rectángulo con texto en medio (botón, pastilla) se reconoce por sus márgenes."""
+    for i, (y, s, n) in enumerate(filas):
+        c = 0
+        for y2, s2, n2 in filas[i:]:
+            if y2 - y > ventana:
+                break
+            if abs(s2 - s) <= tol and abs(n2 - n) <= max(5, n * 0.25):
+                c += 1
+        if c >= min_filas:
+            return True
+    return False
+
+
+def _palabras_barra(mask, x0, x1, y0, y1):
+    banda = mask.crop((x0, y0, x1, y1))
+    bw, bh = banda.size
+    t = banda.transpose(Image.TRANSPOSE).tobytes()
+    cols = [t[x * bh:(x + 1) * bh].count(255) >= 2 for x in range(bw)]
+    return sum(1 for a, b in _tramos(cols, 3) if 14 <= b - a + 1 <= 45)
+
+
+def hay_lobby_amplio(img):
+    """Lobby = (botón amarillo grande abajo a la izquierda Y pastilla gris clara arriba a la izquierda)
+    O la barra de menús de arriba (JUGAR · TIENDA · TAQUILLA · PASES...) con varias palabras blancas.
+    Se analiza la pantalla entera reducida a 270 px de alto. Devuelve (ok, boton, pastilla, palabras)."""
+    h0 = 270
+    w0 = max(120, int(round(img.width * h0 / float(img.height))))
+    p = img.convert("RGB").resize((w0, h0), Image.BOX)
+    xr = int(w0 * 0.55)
+    boton = _hay_bloque(_filas_largas(_mask_amarillo(p), 0, int(h0 * 0.55), xr, h0, int(h0 * 0.10)), 6, 24)
+    pastilla = _hay_bloque(_filas_largas(_mask_claro(p, _L_G185), 0, 0, xr, int(h0 * 0.12), 14), 4, 14)
+    palabras = _palabras_barra(_mask_claro(p, _L_G215), 0, int(w0 * 0.85), int(h0 * 0.035), int(h0 * 0.095))
+    return ((boton and pastilla) or palabras >= 4), boton, pastilla, palabras
+
+
 def buscar_ventana_fortnite():
     user32 = ctypes.windll.user32
     encontrada = []
@@ -2427,6 +2508,7 @@ class App:
         self.lobby_no = 0
         self.en_lobby = False
         self.lobby_info = (0.0, 0.0)
+        self.lobby_modo = ""
         self.t_inicio = time.time()
         self.t_otros = 0.0
         self.aviso_txt = ""
@@ -4213,6 +4295,17 @@ class App:
         except Exception:
             return
         self.lobby_info = (fa, fp)
+        modo = "fijo" if ok else ""
+        if not ok:
+            # el detector de cajas fijas no lo ve: se prueba el tolerante (pantalla entera)
+            try:
+                ok2, _b, _p, pal = hay_lobby_amplio(self.capturar_caja(rect, (0.0, 0.0, 1.0, 1.0)))
+                if ok2:
+                    ok = True
+                    modo = "amplio"
+            except Exception:
+                pass
+        self.lobby_modo = modo
         if ok:
             self.lobby_no = 0
             self.lobby_si += 1
@@ -4443,10 +4536,11 @@ class App:
                 a = self.ultimo_aviso
                 det = ("aviso: parece COFRE %d%%" % int(a["cofre"] * 100)) if a else "sin aviso"
                 ms = int((time.time() - t_ini) * 1000)
-                self.lbl_detalle.config(text="Avisos: %d (%s · clásico %s l1=%d l2=%d ancho=%d)  ·  Lista: %s  ·  Lobby: botón=%d%% menú=%d%%  ·  ciclo %d ms"
+                self.lbl_detalle.config(text="Avisos: %d (%s · clásico %s l1=%d l2=%d ancho=%d)  ·  Lista: %s  ·  Lobby: botón=%d%% menú=%d%% (%s)  ·  ciclo %d ms"
                                         % (n_av, det, "SÍ" if ok_v else "no", v1, v2, vw,
                                            ("%d cofres" % lista["n"]) if lista else "no",
-                                           int(self.lobby_info[0] * 100), int(self.lobby_info[1] * 100), ms))
+                                           int(self.lobby_info[0] * 100), int(self.lobby_info[1] * 100),
+                                           self.lobby_modo or "no", ms))
         except Exception as e:
             msg_err = "%s: %s" % (type(e).__name__, e)
             if msg_err != self._ult_err:          # se apunta una vez, no 12 veces por segundo
