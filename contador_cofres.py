@@ -110,7 +110,7 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.3.3"
+VERSION = "1.3.5"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 # Base de datos de las salas: la misma para todo el mundo, ya viene dentro del programa.
 URL_SALAS = "https://cofres-7beb6-default-rtdb.europe-west1.firebasedatabase.app"
@@ -241,7 +241,9 @@ ANCHO_ANALISIS_BASE = 1456.0
 
 INTERVALO_MS = 80
 FRAMES_PARA_CONTAR = 2      # fotogramas seguidos viendo un aviso nuevo para darlo por bueno (~0,15 s)
-FRAMES_PARA_REARMAR = 4     # fotogramas seguidos sin ese aviso para dar por terminado el anterior
+FRAMES_PARA_REARMAR = 4     # (ya no se usa: ahora se rearma por tiempo, ver TIEMPO_REARMAR)
+UMBRAL_SOSTENER = 0.62      # un aviso ya contado se mantiene con parecido >= 0,62 (en la misma posición)
+TIEMPO_REARMAR = 0.30       # segundos sin ver un aviso para darlo por terminado
 MAX_DETECCIONES_GUARDADAS = 25
 
 # Detección del lobby (medido sobre tu captura): (x, y, ancho, alto) en fracciones de la ventana
@@ -1253,6 +1255,14 @@ def buscar_avisos(img, depurar=False):
     return avisos
 
 
+def y_cofre(a):
+    """Posición vertical de un aviso (para reconocer el mismo aviso de un fotograma al siguiente)."""
+    for k in ("yc", "yb", "y"):
+        if k in a:
+            return a[k]
+    return 0
+
+
 # --- aviso APILADO: cuando abres varios cofres seguidos el juego los junta en una sola lista ------
 #       +5750 PE
 #       COFRE RARO
@@ -1267,15 +1277,16 @@ _DIGITOS_PLANT = []
 
 
 def _plantillas_digitos():
-    """Dígitos 2-9 dibujados con una fuente gruesa de Windows (cursiva y recta), para reconocer
-    el número del «X3». Si no hay fuente disponible, devuelve vacío y se asume «X2»."""
+    """Dígitos 2-9 dibujados con fuentes gruesas de Windows (rectas e inclinadas), para reconocer
+    el número del «X3». Impact se parece mucho a la letra del juego. Si no hay ninguna fuente
+    disponible, devuelve vacío y se asume «X2»."""
     if _DIGITOS_PLANT:
         return _DIGITOS_PLANT[0]
     res = {}
     try:
         from PIL import ImageFont
         fuentes = []
-        for nombre in ("arialbi.ttf", "arialbd.ttf"):
+        for nombre in ("impact.ttf", "arialbi.ttf", "arialbd.ttf", "ariblk.ttf", "segoeuib.ttf"):
             try:
                 fuentes.append(ImageFont.truetype(nombre, 48))
             except Exception:
@@ -1283,11 +1294,14 @@ def _plantillas_digitos():
         for d in range(2, 10):
             variantes = []
             for fu in fuentes:
-                im = Image.new("L", (72, 80), 0)
-                ImageDraw.Draw(im).text((12, 8), str(d), font=fu, fill=255)
-                bb = im.getbbox()
-                if bb:
-                    variantes.append(list(im.crop(bb).resize((DIG_W, DIG_H), Image.BILINEAR).tobytes()))
+                im = Image.new("L", (96, 80), 0)
+                ImageDraw.Draw(im).text((20, 8), str(d), font=fu, fill=255)
+                for sh in (0.0, 0.22):          # recto e inclinado (cursiva)
+                    im2 = im if sh == 0 else im.transform(im.size, Image.AFFINE, (1, sh, -sh * 40, 0, 1, 0),
+                                                          Image.BILINEAR)
+                    bb = im2.getbbox()
+                    if bb:
+                        variantes.append(list(im2.crop(bb).resize((DIG_W, DIG_H), Image.BILINEAR).tobytes()))
             if variantes:
                 res[d] = variantes
     except Exception:
@@ -1323,7 +1337,7 @@ def _leer_digito(m, x0, x1, y0, y1):
             s = _ncc_listas(v, t)
             if s > mejor:
                 mejor, mejor_d = s, d
-    return mejor_d if mejor >= 0.45 else None
+    return mejor_d if mejor >= 0.40 else None
 
 
 def _multiplicador_linea(m, B):
@@ -2474,6 +2488,11 @@ class App:
         self.sube_hueco = 0
         self.lista_max = 0        # máximo de cofres vistos en el aviso apilado que sigue en pantalla
         self.lista_cero = 0       # fotogramas seguidos sin aviso apilado
+        self.lista_hist = deque(maxlen=3)   # últimas lecturas del aviso apilado (para ignorar lecturas sueltas mal hechas)
+        self.t_visto = 0.0        # última vez que se vio el aviso (para saber cuándo da por terminado)
+        self.pos_avisos = []      # posición vertical de los avisos ya contados
+        self.n_visto = 0          # avisos vistos en el último fotograma
+        self.visto_seg = 0        # fotogramas seguidos viendo algún aviso
         self.frames_recientes = deque(maxlen=8)
         self.t_frame = 0.0
         self.sube = 0
@@ -3411,6 +3430,23 @@ class App:
         else:
             self.cfg_sucio = True
 
+    def overlay_tapa_zona(self, rect):
+        """True si el número flotante está encima de la zona donde salen los avisos de cofre
+        (se tapa en negro para el análisis y ese aviso no se podría ver)."""
+        ov = self.overlay
+        if ov is None or not self.var_ov.get():
+            return False
+        try:
+            if not ov.win.winfo_viewable():
+                return False
+            ax, ay = ov.win.winfo_rootx(), ov.win.winfo_rooty()
+            bx, by = ax + ov.win.winfo_width(), ay + ov.win.winfo_height()
+        except tk.TclError:
+            return False
+        left, top, w, h = rect
+        zx0, zy0 = left + FX0 * w, top + FY0 * h
+        return ax < zx0 + FW * w and bx > zx0 and ay < zy0 + FH * h and by > zy0
+
     # ---------- animaciones ----------
     def destello(self, paso=0):
         colores = ["#ffffff", "#fff3b0", "#ffe27a", "#ffd24d", ORO]
@@ -4305,6 +4341,10 @@ class App:
                     modo = "amplio"
             except Exception:
                 pass
+        # Si hay un aviso de cofre sostenido en pantalla, no puede ser el lobby (falso positivo)
+        if ok and not self.en_lobby and self.visto_seg >= 4:
+            ok = False
+            modo = ""
         self.lobby_modo = modo
         if ok:
             self.lobby_no = 0
@@ -4414,13 +4454,35 @@ class App:
                 self.sube = 0
                 self.sube_hueco = 0
 
+    def filtrar_avisos(self, todos, solo):
+        """Avisos que se dan por cofre. Para uno NUEVO hace falta parecerse mucho a «COFRE»
+        (UMBRAL_COFRE); para mantener uno que ya estaba contado, en la misma posición, basta un
+        parecido menor (UMBRAL_SOSTENER): así la animación no lo da por perdido y lo cuenta dos veces."""
+        if not solo:
+            return list(todos)
+        fijos = self.pos_avisos if self.avisos_conf > 0 else []
+        out = []
+        for a in todos:
+            if a["cofre"] >= UMBRAL_COFRE:
+                out.append(a)
+            elif a["cofre"] >= UMBRAL_SOSTENER and any(abs(y_cofre(a) - y) <= 8 for y in fijos):
+                out.append(a)
+        if out:
+            self.pos_avisos = [y_cofre(a) for a in out]
+        elif self.avisos_conf == 0:
+            self.pos_avisos = []
+        return out
+
     def procesar(self, n, origen=""):
         """n = cuántos avisos de cofre se ven ahora mismo. Se cuenta un cofre cada vez que n
         SUBE respecto a los ya contados (así, si coges otro cofre mientras el anterior sigue en
         pantalla, el aviso nuevo se apila y también cuenta). Hay que verlo varios fotogramas
-        seguidos para fiarse, y también varios sin verlo para dar un aviso por terminado."""
+        seguidos para fiarse, y llevar un rato (TIEMPO_REARMAR) sin verlo para dar un aviso por
+        terminado: se mide en tiempo y no en fotogramas, para que funcione igual si el PC va lento."""
+        ahora = time.time()
         conf = self.avisos_conf
         if n > conf:
+            self.t_visto = ahora
             self.baja = 0
             self.sube_hueco = 0
             if n == self.cand_n:
@@ -4438,10 +4500,13 @@ class App:
         elif n < conf:
             self.enfriar_sube()
             self.baja += 1
-            if self.baja >= FRAMES_PARA_REARMAR:
+            if self.baja >= 2 and ahora - self.t_visto >= TIEMPO_REARMAR:
                 self.avisos_conf = n
                 self.baja = 0
+                if n > 0:
+                    self.t_visto = ahora
         else:
+            self.t_visto = ahora
             self.enfriar_sube()
             self.baja = 0
 
@@ -4456,9 +4521,11 @@ class App:
             self.lbl_estado.config(text=msg, fg=APAGADO)
 
     def tick(self):
+        t_ini = time.time()
         try:
-            t_ini = time.time()
             rect, msg = self.region_juego()
+            if rect is not None and self.overlay_tapa_zona(rect):
+                msg = "⚠ El número flotante está sobre la zona de los avisos: muévelo (se tapa y no se ve el cofre)"
             if rect is None:
                 self.luz.config(fg=APAGADO)
                 self.lbl_luz.config(text="sin juego", fg=APAGADO)
@@ -4470,6 +4537,10 @@ class App:
                 self.sube = self.baja = 0
                 self.lista_max = 0
                 self.lista_cero = 0
+                self.lista_hist.clear()
+                self.pos_avisos = []
+                self.n_visto = 0
+                self.visto_seg = 0
             else:
                 self.tick_n += 1
                 if self.tick_n % LOBBY_CADA == 0:
@@ -4483,7 +4554,7 @@ class App:
                 todos = buscar_avisos(pequena)
                 solo = bool(self.var_solo_cofre.get())
                 # con "solo COFRE" (lo normal) la experiencia de la partida y demás avisos se ignoran
-                avisos = [a for a in todos if a["cofre"] >= UMBRAL_COFRE] if solo else todos
+                avisos = self.filtrar_avisos(todos, solo)
                 otros = [a for a in todos if a not in avisos]
                 ok_v, v1, v2, vw = hay_aviso_clasico(vieja)
                 n_av = len(avisos)
@@ -4501,18 +4572,22 @@ class App:
                 except Exception:
                     lista = None
                 if lista and lista["activo"]:
-                    n_av = lista["n"]
                     origen = "lista"
                     otros = []
                     self.lista_cero = 0
-                    # mientras la lista siga en pantalla la cuenta solo sube (si un número se lee
-                    # mal un instante, no se cuenta dos veces)
-                    self.lista_max = max(self.lista_max, n_av)
+                    # Mientras la lista siga en pantalla la cuenta solo sube. Para que una lectura
+                    # suelta mal hecha del «X3» no infle la cuenta, se toma el valor que se repite
+                    # (el segundo mayor de las últimas 3 lecturas); nunca por debajo de las líneas «COFRE».
+                    self.lista_hist.append(lista["n"])
+                    h = sorted(self.lista_hist)
+                    robusto = h[-2] if len(h) >= 2 else lista["lineas"]
+                    self.lista_max = max(self.lista_max, robusto, lista["lineas"])
                     n_av = self.lista_max
                 else:
                     self.lista_cero += 1
                     if self.lista_cero >= 2:
                         self.lista_max = 0
+                        self.lista_hist.clear()
                     elif self.lista_max > 0:
                         n_av = max(n_av, self.lista_max)
                         origen = "lista"
@@ -4523,6 +4598,8 @@ class App:
                 self.ultimo_aviso = avisos[0] if avisos else (otros[0] if otros else None)
                 self.guardar_otros(otros)
                 self.procesar(n_av, origen)
+                self.n_visto = n_av
+                self.visto_seg = self.visto_seg + 1 if n_av > 0 else 0
                 visto = n_av > 0
                 if self.en_lobby:
                     self.luz.config(fg=CIAN)
@@ -4551,7 +4628,8 @@ class App:
                 except Exception:
                     pass
             self.lbl_estado.config(text="Error: %s" % e)
-        self.root.after(INTERVALO_MS, self.tick)
+        # el ciclo mide INTERVALO_MS en total (descontando lo que ha tardado el análisis)
+        self.root.after(max(25, INTERVALO_MS - int((time.time() - t_ini) * 1000)), self.tick)
 
     # ---------- diagnóstico ----------
     def diagnostico(self):
