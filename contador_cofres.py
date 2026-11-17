@@ -112,7 +112,7 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.3.8"
+VERSION = "1.3.9"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 # Base de datos de las salas: la misma para todo el mundo, ya viene dentro del programa.
 URL_SALAS = "https://cofres-7beb6-default-rtdb.europe-west1.firebasedatabase.app"
@@ -156,6 +156,83 @@ def buscar_actualizacion():
     return None
 
 
+# ---------------------------------------------------------------- código local cifrado
+# El código que se descarga (el programa nuevo y sus archivos de apoyo) se guarda SIEMPRE cifrado en la
+# carpeta de datos: en el disco nunca queda un ".py" en claro que alguien pueda abrir y leer sin más.
+# Usa AES-256-CBC con la librería de cifrado que trae Windows (bcrypt.dll); no hace falta nada aparte.
+# Ojo: la clave vive en este mismo programa, así que esto frena a quien cotillee la carpeta, no a quien
+# desmonte el programa a propósito. El código fuente de verdad sigue público, sin cifrar, en GitHub.
+_CLAVE_CODIGO = bytes.fromhex("cf8862ebdb0ce77a84ed8265eac8f9e7791a909a926444d3bc7ab9ca25f460b3")
+_MARCA_CIFRADO = b"CC01"
+
+
+def _bcrypt_aes(clave, datos, iv, cifrar):
+    bc = ctypes.WinDLL("bcrypt")
+    VP = ctypes.c_void_p
+    bc.BCryptOpenAlgorithmProvider.argtypes = [ctypes.POINTER(VP), ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong]
+    bc.BCryptSetProperty.argtypes = [VP, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong]
+    bc.BCryptGenerateSymmetricKey.argtypes = [VP, ctypes.POINTER(VP), VP, ctypes.c_ulong, ctypes.c_char_p,
+                                              ctypes.c_ulong, ctypes.c_ulong]
+    bc.BCryptEncrypt.argtypes = [VP, ctypes.c_char_p, ctypes.c_ulong, VP, ctypes.c_char_p, ctypes.c_ulong,
+                                 ctypes.c_char_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.c_ulong]
+    bc.BCryptDecrypt.argtypes = bc.BCryptEncrypt.argtypes
+    bc.BCryptDestroyKey.argtypes = [VP]
+    bc.BCryptCloseAlgorithmProvider.argtypes = [VP, ctypes.c_ulong]
+    BCRYPT_BLOCK_PADDING = 0x00000001
+    alg, key = VP(), VP()
+    if bc.BCryptOpenAlgorithmProvider(ctypes.byref(alg), "AES", None, 0):
+        raise ValueError("Windows no deja usar AES")
+    try:
+        modo = "ChainingModeCBC"
+        bc.BCryptSetProperty(alg, "ChainingMode", modo, (len(modo) + 1) * 2, 0)
+        if bc.BCryptGenerateSymmetricKey(alg, ctypes.byref(key), None, 0, bytes(clave), len(clave), 0):
+            raise ValueError("clave no válida")
+        iv_buf = ctypes.create_string_buffer(bytes(iv), 16)
+        fn = bc.BCryptEncrypt if cifrar else bc.BCryptDecrypt
+        tam = len(datos) + (16 if cifrar else 0)
+        out = ctypes.create_string_buffer(max(tam, 16))
+        hecho = ctypes.c_ulong(0)
+        r = fn(key, bytes(datos), len(datos), None, iv_buf, 16, out, len(out), ctypes.byref(hecho),
+              BCRYPT_BLOCK_PADDING)
+        bc.BCryptDestroyKey(key)
+        if r:
+            raise ValueError("no se pudo %s (código %d)" % ("cifrar" if cifrar else "descifrar", r))
+        return out.raw[:hecho.value]
+    finally:
+        bc.BCryptCloseAlgorithmProvider(alg, 0)
+
+
+def _cifrar_codigo(datos):
+    iv = os.urandom(16)
+    return _MARCA_CIFRADO + iv + _bcrypt_aes(_CLAVE_CODIGO, datos, iv, True)
+
+
+def _descifrar_codigo(datos):
+    if not datos.startswith(_MARCA_CIFRADO):
+        raise ValueError("el archivo no está en el formato cifrado esperado")
+    iv, cuerpo = datos[4:20], datos[20:]
+    return _bcrypt_aes(_CLAVE_CODIGO, cuerpo, iv, False)
+
+
+def _cargar_modulo_cifrado(ruta, nombre):
+    """Descifra un archivo de código en memoria y lo registra como módulo, sin escribir nunca el texto
+    en claro en el disco."""
+    with open(ruta, "rb") as f:
+        cifrado = f.read()
+    texto = _descifrar_codigo(cifrado).decode("utf-8")
+    import types
+    mod = types.ModuleType(nombre)
+    mod.__file__ = ruta
+    codigo = compile(texto, ruta, "exec")
+    sys.modules[nombre] = mod
+    try:
+        exec(codigo, mod.__dict__)
+    except Exception:
+        sys.modules.pop(nombre, None)
+        raise
+    return mod
+
+
 def _nombre_extra_valido(nombre):
     n = os.path.basename(str(nombre or ""))
     ok = re.fullmatch(r"[A-Za-z0-9_]+\.py", n) and n.lower() != "contador_cofres.py"
@@ -189,11 +266,21 @@ def _bajar_extra(nombre, sha="", timeout=40):
 
 
 def _escribir_codigo(ruta, datos):
+    """Guarda el código SIEMPRE cifrado: en el disco no queda nunca el texto en claro."""
     os.makedirs(os.path.dirname(ruta), exist_ok=True)
     tmp = ruta + ".tmp"
     with open(tmp, "wb") as f:
-        f.write(datos)
+        f.write(_cifrar_codigo(datos))
     os.replace(tmp, ruta)
+
+
+def _sha_de_codigo_guardado(ruta):
+    """sha256 del contenido en claro de un archivo de código ya guardado (cifrado). "" si no se puede leer."""
+    try:
+        with open(ruta, "rb") as f:
+            return hashlib.sha256(_descifrar_codigo(f.read())).hexdigest()
+    except Exception:
+        return ""
 
 
 def descargar_actualizacion(info):
@@ -213,13 +300,8 @@ def descargar_actualizacion(info):
     extras = []
     for n, sha_x, obligatorio in _extras_de(info):
         ruta = os.path.join(CARPETA_CODIGO, n)
-        if sha_x and os.path.isfile(ruta):
-            try:
-                with open(ruta, "rb") as f:
-                    if hashlib.sha256(f.read()).hexdigest() == sha_x:
-                        continue            # ya lo tienes igual: no se vuelve a bajar
-            except OSError:
-                pass
+        if sha_x and os.path.isfile(ruta) and _sha_de_codigo_guardado(ruta) == sha_x:
+            continue                        # ya lo tienes igual: no se vuelve a bajar
         try:
             extras.append((ruta, _bajar_extra(n, sha_x)))
         except Exception as e:
@@ -250,7 +332,7 @@ def _lanzar_codigo_nuevo():
         if not os.path.isfile(ARCHIVO_CODIGO):
             return False
         with open(ARCHIVO_CODIGO, "rb") as f:
-            texto = f.read().decode("utf-8")
+            texto = _descifrar_codigo(f.read()).decode("utf-8")
         if version_tupla(version_de_codigo(texto)) <= version_tupla(VERSION):
             return False
         codigo = compile(texto, ARCHIVO_CODIGO, "exec")
@@ -9330,24 +9412,22 @@ App.__init__ = _init_seguro
 # ---------------------------------------------------------------- recuento con lector_repeticiones.py
 # Si lector_repeticiones.py está junto al programa, el recuento al final de cada partida usa ese lector
 # (no necesita la DLL de Oodle). Si no está o falla, se usa el sistema anterior (DLL).
-# Ojo: ese archivo es GPL v3; si compartes el programa con alguien, también debe compartirse bajo GPL v3.
-# El lector se busca junto al programa y, si no está, en «codigo» (carpeta de datos), donde lo deja la actualización.
+# Ojo: ese archivo es GPL v3; si compartes el programa con alguien, también debe compartirse bajo GPL v3
+# (el código fuente de verdad sigue público, sin cifrar, en el repositorio de GitHub: la copia local cifrada
+# de abajo es solo para que no quede un ".py" suelto y legible en la carpeta de datos de cada quien lo use).
 try:
     asegurar_extras()
 except Exception:
     pass
-if CARPETA_CODIGO not in sys.path:
-    sys.path.append(CARPETA_CODIGO)         # al final: si lo tienes junto al programa, manda ese
 try:
-    import importlib
-    importlib.invalidate_caches()
+    import lector_repeticiones as _lector_rep        # si lo tienes junto al programa (tú, en desarrollo), ese manda
 except Exception:
-    pass
-try:
-    import lector_repeticiones as _lector_rep
-except Exception as _e_lector:
-    _lector_rep = None
-    registrar_error("lector_repeticiones no disponible: %s" % (_e_lector or type(_e_lector).__name__))
+    try:
+        _lector_rep = _cargar_modulo_cifrado(os.path.join(CARPETA_CODIGO, "lector_repeticiones.py"),
+                                             "lector_repeticiones")
+    except Exception as _e_lector:
+        _lector_rep = None
+        registrar_error("lector_repeticiones no disponible: %s" % (_e_lector or type(_e_lector).__name__))
 _analizar_dll = analizar_repeticion
 _buscar_oodle_orig = buscar_oodle
 
