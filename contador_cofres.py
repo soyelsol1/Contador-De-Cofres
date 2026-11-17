@@ -112,7 +112,7 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 # Base de datos de las salas: la misma para todo el mundo, ya viene dentro del programa.
 URL_SALAS = "https://cofres-7beb6-default-rtdb.europe-west1.firebasedatabase.app"
@@ -5471,8 +5471,6 @@ class App:
         copia_diaria()
 
         datos = self.cargar()
-        if not datos:      # instalación nueva (no hay archivo de datos): el modo «Replays» viene activado por defecto
-            datos = {"ui": {"modo_conteo": "replays"}, "manual": True, "repeticion": True}
         # ajustes nuevos: ventana encima de las demás o no, conteo solo manual y lector de texto
         self.ini_encima = bool(datos.get("encima", False))
         self.ini_manual = bool(datos.get("manual", False))
@@ -7887,7 +7885,7 @@ class App:
             self.aplicar_recuento({"res": res, "contados": contados, "t": ahora,
                                    "indice": (len(self.hist.partidas) - 1) if guardada else None})
             return
-        if v["hilo"] is not None or ahora - v["t"] < 0.25:
+        if v["hilo"] is not None or ahora - v["t"] < 0.5:
             return
         v["t"] = ahora
         ruta = repeticion_reciente(self.t_inicio - 5)              # solo repeticiones de partidas jugadas con el programa abierto
@@ -8091,8 +8089,8 @@ class App:
 
     def aplicar_lobby(self, info):
         """info = lo que devuelve mirar_lobby() (se calcula en segundo plano)."""
-        if info is None or self.cfg_ui.get("modo_conteo") == "replays":
-            return          # en modo replays la partida se cierra al terminar la repetición, no con el lobby
+        if info is None:
+            return
         ok, fa, fp, modo = info
         self.lobby_info = (fa, fp)
         # Si hay un aviso de cofre sostenido en pantalla, no puede ser el lobby (falso positivo)
@@ -8329,7 +8327,7 @@ class App:
         que sigue (si lo tienes activado) es cerrar la partida al volver al lobby."""
         if self.avisos_conf or self.n_visto or self.seguidor.pistas or self.ses_cont:
             self.reiniciar_detector()
-        if self.var_lobby.get() and self.cfg_ui.get("modo_conteo") != "replays":
+        if self.var_lobby.get():
             self.tick_n += 1
             r = self.trab.recoger()
             if r is not None and r[0]:
@@ -9139,7 +9137,7 @@ class _UI:
     TEXTOS_MODO = {
         "manual": "Solo cuentas tú, con el atajo o el botón +1. No se mira la pantalla ni se leen repeticiones.",
         "pantalla": "Se cuentan solos mirando los avisos de la pantalla. No se leen repeticiones.",
-        "replays": "No se cuenta en directo: al terminar cada partida (en cuanto Fortnite cierra la repetición, sin esperar al lobby) se lee su "
+        "replays": "No se cuenta en directo: al terminar cada partida (lobby o «Nueva partida») se lee su "
                    "repetición y se suman los cofres. En Fortnite tiene que estar activado «Grabar repeticiones».",
     }
 
