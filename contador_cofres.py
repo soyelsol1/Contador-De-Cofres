@@ -112,7 +112,7 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.3.9"
+VERSION = "1.4.0"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 # Base de datos de las salas: la misma para todo el mundo, ya viene dentro del programa.
 URL_SALAS = "https://cofres-7beb6-default-rtdb.europe-west1.firebasedatabase.app"
@@ -359,6 +359,8 @@ def reiniciar_programa():
         cmd = [sys.executable]
     else:
         cmd = [sys.executable, os.path.abspath(sys.argv[0])]
+    if "--con-fortnite" in sys.argv:         # si lo abrió Fortnite, tras actualizar sigue cerrándose con él
+        cmd.append("--con-fortnite")
     subprocess.Popen(cmd, env=env, close_fds=True, creationflags=0x00000008 | 0x00000200)
 
 
@@ -606,14 +608,16 @@ CLAVE_INICIO = r"Software\Microsoft\Windows\CurrentVersion\Run"
 NOMBRE_INICIO = "ContadorDeCofres"
 
 
-def _comando_inicio():
+def _comando_inicio(extra=""):
     if getattr(sys, "frozen", False):
-        return '"%s"' % sys.executable
-    exe = sys.executable
-    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
-    if os.path.isfile(pyw):
-        exe = pyw
-    return '"%s" "%s"' % (exe, os.path.abspath(sys.argv[0]))
+        base = '"%s"' % sys.executable
+    else:
+        exe = sys.executable
+        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.isfile(pyw):
+            exe = pyw
+        base = '"%s" "%s"' % (exe, os.path.abspath(sys.argv[0]))
+    return base + ((" " + extra) if extra else "")
 
 
 def inicio_windows_activo():
@@ -641,6 +645,148 @@ def poner_inicio_windows(activar):
         return True
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------- abrir con Fortnite
+# «Abrir con Fortnite»: al iniciar sesión en Windows arranca un vigilante sin ventana (el mismo programa con
+# el argumento --vigilar-fortnite). Cuando Fortnite se enciende, el vigilante abre el contador (con
+# --con-fortnite) y, cuando Fortnite se cierra, el contador se cierra solo.
+ARG_VIGILAR = "--vigilar-fortnite"
+ARG_CON_FORTNITE = "--con-fortnite"
+PROCESOS_FORTNITE = ("fortniteclient-win64-shipping.exe",)
+
+
+class _EntradaProceso(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def fortnite_abierto():
+    """True si el juego (FortniteClient-Win64-Shipping.exe) está en marcha. Rápido y sin ventanas."""
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_EntradaProceso)]
+        k.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_EntradaProceso)]
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = k.CreateToolhelp32Snapshot(0x2, 0)          # TH32CS_SNAPPROCESS
+        if h in (None, 0, ctypes.c_void_p(-1).value):
+            return False
+        try:
+            e = _EntradaProceso()
+            e.dwSize = ctypes.sizeof(_EntradaProceso)
+            ok = k.Process32FirstW(h, ctypes.byref(e))
+            while ok:
+                if e.szExeFile.lower() in PROCESOS_FORTNITE:
+                    return True
+                ok = k.Process32NextW(h, ctypes.byref(e))
+        finally:
+            k.CloseHandle(h)
+    except Exception:
+        pass
+    return False
+
+
+def inicio_fortnite_activo():
+    """«Abrir con Fortnite» está activado si el arranque de Windows lanza el vigilante."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CLAVE_INICIO) as k:
+            valor = winreg.QueryValueEx(k, NOMBRE_INICIO)[0]
+        return ARG_VIGILAR in str(valor)
+    except Exception:
+        return False
+
+
+def poner_inicio_fortnite(activar):
+    """Activa o desactiva «Abrir con Fortnite». Devuelve True si se pudo."""
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, CLAVE_INICIO) as k:
+            if activar:
+                winreg.SetValueEx(k, NOMBRE_INICIO, 0, winreg.REG_SZ, _comando_inicio(ARG_VIGILAR))
+            else:
+                try:
+                    winreg.DeleteValue(k, NOMBRE_INICIO)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        return False
+
+
+def migrar_inicio_fortnite():
+    """Quien tenía el antiguo «Abrir con Windows» pasa a «Abrir con Fortnite» (el programa ya no se abre solo
+    al encender el PC, sino al encender Fortnite)."""
+    try:
+        if inicio_windows_activo() and not inicio_fortnite_activo():
+            poner_inicio_fortnite(True)
+    except Exception:
+        pass
+
+
+def _lista_programa(*extra):
+    if getattr(sys, "frozen", False):
+        base = [sys.executable]
+    else:
+        exe = sys.executable
+        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        base = [pyw if os.path.isfile(pyw) else exe, os.path.abspath(sys.argv[0])]
+    return base + list(extra)
+
+
+def _lanzar_aparte(*extra):
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    env.pop("_MEIPASS2", None)
+    subprocess.Popen(_lista_programa(*extra), env=env, close_fds=True,
+                     creationflags=0x00000008 | 0x00000200 | 0x08000000)
+
+
+def app_abierta():
+    """True si el contador ya está abierto (comprueba el mismo candado que usa para no abrirse dos veces)."""
+    try:
+        h = ctypes.windll.kernel32.OpenMutexW(0x00100000, False, "ContadorDeCofres_UnicaInstancia")
+        if h:
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def vigilante_fortnite():
+    """Proceso sin ventana: abre el contador cuando se enciende Fortnite. Se acaba solo si se desactiva
+    «Abrir con Fortnite»."""
+    try:
+        k = ctypes.windll.kernel32
+        h = k.CreateMutexW(None, False, "ContadorDeCofres_Vigilante")
+        if k.GetLastError() == 183:      # ya hay un vigilante
+            return
+        globals()["_MUTEX_VIG"] = h
+    except Exception:
+        pass
+    antes = False
+    while True:
+        try:
+            if not inicio_fortnite_activo():
+                return
+            ahora = fortnite_abierto()
+            if ahora and not antes and not app_abierta():
+                _lanzar_aparte(ARG_CON_FORTNITE)
+            antes = ahora
+        except Exception:
+            pass
+        time.sleep(3)
+
+
+if __name__ == "__main__" and ARG_VIGILAR in sys.argv:
+    vigilante_fortnite()
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------- guardado seguro
@@ -5622,8 +5768,22 @@ class App:
         copia_diaria()
 
         datos = self.cargar()
-        if not datos:      # instalación nueva (no hay archivo de datos): el modo «Replays» viene activado por defecto
-            datos = {"ui": {"modo_conteo": "replays"}, "manual": True, "repeticion": True}
+        self.instalacion_nueva = not datos
+        migrar_inicio_fortnite()
+        self.dlg_guia = None
+        if not datos:      # instalación nueva (no hay archivo de datos): el modo «Replays» y las actualizaciones
+            #                automáticas vienen activados por defecto
+            datos = {"ui": {"modo_conteo": "replays", "upd": "auto"}, "manual": True, "repeticion": True}
+        if self.instalacion_nueva:
+            # primera vez: ANTES de enseñar el programa se explica el ajuste de Fortnite (la ventana principal
+            # se queda escondida hasta que se cierre esa explicación)
+            root.withdraw()
+            try:
+                guia = self.dialogo_guia_replays(primera=True)
+                if guia is not None:
+                    root.wait_window(guia)
+            except Exception as e:
+                registrar_error("guía de replays: %s" % (e or type(e).__name__))
         # ajustes nuevos: ventana encima de las demás o no, conteo solo manual y lector de texto
         self.ini_encima = bool(datos.get("encima", False))
         self.ini_manual = bool(datos.get("manual", False))
@@ -5804,6 +5964,10 @@ class App:
         self.root.after(3000, self.pedir_novedades)
         if not self.var_fotos.get():
             self.borrar_fotos()          # limpia las fotos antiguas al abrir
+        if self.instalacion_nueva:
+            self.root.deiconify()        # ahora sí: la guía ya se ha cerrado
+        if ARG_CON_FORTNITE in sys.argv:
+            self.iniciar_vigilancia_fortnite()      # lo abrió Fortnite: se cierra cuando Fortnite se cierre
 
     # ---------- piezas de interfaz ----------
     def boton(self, padre, texto, comando, color, ancho=7):
@@ -6498,10 +6662,11 @@ class App:
         cab.pack(fill="x", pady=(0, 4))
         tk.Label(cab, text="👥  EQUIPO", font=("Segoe UI Semibold", 10), fg=ORO,
                  bg=PANEL).pack(side="left")
-        self.boton_texto(cab, "⚙ Conectar", self.dialogo_conexion).pack(side="right")
+        fb = ("Segoe UI Semibold", 9)
+        BotonSuave(cab, "⚙  Conectar", self.dialogo_conexion, MORADO, 0, fb, 2, 10).pack(side="right")
         self.cab_amigos = cab
-        self.btn_gestion = self.boton_texto(cab, "👑 Gestionar", self.dialogo_gestion, fg=ORO)
-        self.btn_salir = self.boton_texto(cab, "🚪 Salir de la sala", self.salir_de_sala, fg=ROJO)
+        self.btn_gestion = BotonSuave(cab, "👑  Gestionar", self.dialogo_gestion, "#b7791f", 0, fb, 2, 10)
+        self.btn_salir = BotonSuave(cab, "🚪  Salir de la sala", self.salir_de_sala, "#c0394b", 0, fb, 2, 10)
         self.fr_amigos = tk.Frame(fa, bg=PANEL)
         self.fr_amigos.pack(fill="x", pady=(0, 2))
         self.lbl_sync = tk.Label(fa, text="Sin conectar.", font=("Segoe UI", 8), fg=APAGADO,
@@ -6616,10 +6781,23 @@ class App:
         self.guardar()
 
     def al_cambiar_inicio(self):
-        if not poner_inicio_windows(self.var_inicio.get()):
-            self.var_inicio.set(not self.var_inicio.get())
-            messagebox.showerror("Iniciar con Windows", "No se pudo cambiar el inicio automático.",
+        """«Abrir con Fortnite»: el contador se abre solo cuando se enciende Fortnite y se cierra con él."""
+        activar = bool(self.var_inicio.get())
+        if not poner_inicio_fortnite(activar):
+            self.var_inicio.set(not activar)
+            messagebox.showerror("Abrir con Fortnite", "No se pudo cambiar el inicio automático.",
                                  parent=self.root)
+            return
+        self.cfg_ui["con_fortnite"] = activar
+        if activar:
+            try:
+                _lanzar_aparte(ARG_VIGILAR)          # empieza a vigilar ya, sin esperar a reiniciar Windows
+            except Exception:
+                pass
+            self.aviso("Cuando enciendas Fortnite se abrirá el contador solo, y se cerrará cuando cierres Fortnite.", 12)
+        else:
+            self.aviso("El contador ya no se abre solo con Fortnite.")
+        self.guardar()
 
     def al_cambiar_obs(self):
         self._obs_clave = None
@@ -7363,39 +7541,44 @@ class App:
         caja = tk.Frame(d, bg=CARD, highlightbackground=ORO, highlightthickness=2)
         caja.pack(padx=8, pady=8)
         tk.Label(caja, text="Conectar con tus amigos", font=("Segoe UI Semibold", 13), fg=ORO,
-                 bg=CARD).pack(padx=30, pady=(12, 2))
+                 bg=CARD).pack(padx=30, pady=(14, 2))
         tk.Label(caja, text="Crea una sala nueva o únete a la de un amigo.\n"
                             "Quien crea la sala es el líder.",
                  font=("Segoe UI", 8), fg=APAGADO, bg=CARD, justify="center").pack()
 
         def estilo_entrada(e):
             e.config(font=("Segoe UI", 11), bg=BG, fg=ORO, insertbackground=ORO, relief="flat",
-                     highlightthickness=2, highlightbackground=APAGADO, highlightcolor=ORO)
+                     highlightthickness=2, highlightbackground=LINEA, highlightcolor=ORO)
 
-        tk.Label(caja, text="Tu nombre (así te verán tus amigos)", font=("Segoe UI", 9), fg=TEXTO,
-                 bg=CARD).pack(anchor="w", padx=20, pady=(8, 0))
+        # todo en una rejilla: las dos casillas empiezan y acaban en el mismo sitio (la del nombre ocupa
+        # también el hueco del botón de copiar) y los textos van alineados a la izquierda
+        form = tk.Frame(caja, bg=CARD)
+        form.pack(fill="x", padx=24, pady=(10, 0))
+        form.grid_columnconfigure(0, weight=1, minsize=310)
+
+        tk.Label(form, text="Tu nombre (así te verán tus amigos)", font=("Segoe UI", 9), fg=TEXTO,
+                 bg=CARD, anchor="w").grid(row=0, column=0, columnspan=2, sticky="w")
         v_nombre = tk.StringVar(value=self.cfg_on.get("nombre", ""))
-        e_nombre = tk.Entry(caja, textvariable=v_nombre, width=36)
+        e_nombre = tk.Entry(form, textvariable=v_nombre)
         estilo_entrada(e_nombre)
-        e_nombre.pack(padx=20, pady=(2, 0))
+        e_nombre.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0), ipady=4)
 
-        tk.Label(caja, text="Nombre de la sala", font=("Segoe UI", 9), fg=TEXTO,
-                 bg=CARD).pack(anchor="w", padx=20, pady=(8, 0))
-        fila_cod = tk.Frame(caja, bg=CARD)
-        fila_cod.pack(padx=20, pady=(2, 0), fill="x")
-        v_sala = tk.StringVar(value=self.cfg_on.get("sala") or "cofres")
-        e_sala = tk.Entry(fila_cod, textvariable=v_sala, width=30)
+        tk.Label(form, text="Nombre de la sala", font=("Segoe UI", 9), fg=TEXTO,
+                 bg=CARD, anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        v_sala = tk.StringVar(value=self.cfg_on.get("sala") or "")     # vacío si todavía no hay sala
+        e_sala = tk.Entry(form, textvariable=v_sala)
         estilo_entrada(e_sala)
-        e_sala.pack(side="left")
-        b_copiar = tk.Button(fila_cod, text="📋", bg=PANEL, fg=ORO, activebackground="#40377a",
+        e_sala.grid(row=3, column=0, sticky="ew", pady=(3, 0), ipady=4)
+        b_copiar = tk.Button(form, text="📋", bg=PANEL, fg=ORO, activebackground="#40377a",
                              activeforeground=ORO, relief="flat", bd=0, cursor="hand2",
-                             font=("Segoe UI Emoji", 12), padx=6)
-        b_copiar.pack(side="left", padx=(6, 0), fill="y")
+                             font=("Segoe UI Emoji", 12), padx=10)
+        b_copiar.grid(row=3, column=1, sticky="ns", padx=(8, 0), pady=(3, 0))
+        self.color_suave(b_copiar, "bg", PANEL, "#40377a")
 
-        aviso = tk.Label(caja, text="Crear: inventa un nombre y pásaselo a tus amigos (el icono 📋 lo copia).\n"
+        aviso = tk.Label(form, text="Crear: inventa un nombre y pásaselo a tus amigos (el icono 📋 lo copia).\n"
                                     "Unirse: escribe el nombre que te haya dado quien creó la sala.",
-                         font=("Segoe UI", 8), fg=APAGADO, bg=CARD, wraplength=330, justify="left")
-        aviso.pack(padx=20, pady=(8, 0))
+                         font=("Segoe UI", 8), fg=APAGADO, bg=CARD, wraplength=340, justify="left", anchor="w")
+        aviso.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         def copiar():
             s = limpiar_sala(v_sala.get())
@@ -7449,12 +7632,14 @@ class App:
             esperar()
 
         fila = tk.Frame(caja, bg=CARD)
-        fila.pack(pady=12)
-        b_crear = self.boton(fila, "Crear sala", lambda: lanzar("crear"), "#2e9e5b", 11)
-        b_crear.pack(side="left", padx=4)
-        b_unir = self.boton(fila, "Unirse a sala", lambda: lanzar("unirse"), MORADO, 13)
-        b_unir.pack(side="left", padx=4)
-        self.boton(fila, "Cancelar", d.destroy, "#4a4468", 8).pack(side="left", padx=4)
+        fila.pack(fill="x", padx=24, pady=(16, 16))
+        for k in range(3):
+            fila.grid_columnconfigure(k, weight=1, uniform="bt")          # los tres botones miden lo mismo
+        b_crear = self.boton(fila, "Crear sala", lambda: lanzar("crear"), "#2e9e5b", 10)
+        b_crear.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        b_unir = self.boton(fila, "Unirse a sala", lambda: lanzar("unirse"), MORADO, 10)
+        b_unir.grid(row=0, column=1, sticky="ew", padx=4)
+        self.boton(fila, "Cancelar", d.destroy, "#4a4468", 10).grid(row=0, column=2, sticky="ew", padx=(4, 0))
         d.bind("<Escape>", lambda ev: d.destroy())
 
     def entrar_en_sala(self, nombre, sala, modo):
@@ -7754,7 +7939,8 @@ class App:
             self.lbl_upd.config(text="Hay una versión nueva: %s" % dato.get("version"), fg=ORO)
             ya_dicho = (not dato.get("obligatoria")) and str(dato.get("version")) == self.upd_pospuesta
             if self.upd_manual or not ya_dicho:
-                self.dialogo_actualizacion(dato)
+                auto = (not self.upd_manual) and self.var_upd.get() == "auto"    # «Automáticas»: se instala sola
+                self.dialogo_actualizacion(dato, auto=auto)
         elif tipo == "ok":
             self.upd_info = None
             if self.upd_manual:
@@ -7762,7 +7948,7 @@ class App:
         elif self.upd_manual:
             self.lbl_upd.config(text="No se pudo comprobar (¿sin internet?).", fg=ROJO)
 
-    def dialogo_actualizacion(self, info):
+    def dialogo_actualizacion(self, info, auto=False):
         if self.upd_dlg is not None:
             try:
                 if self.upd_dlg.winfo_exists():
@@ -7853,6 +8039,17 @@ class App:
                 d.grab_set()
             except tk.TclError:
                 pass
+        if auto:
+            lbl_est.config(text="Actualizaciones automáticas: instalando la nueva versión...", fg=ORO)
+
+            def empezar_sola():
+                try:
+                    if d.winfo_exists() and not self.upd_descargando:
+                        si()
+                except tk.TclError:
+                    pass
+
+            d.after(1200, empezar_sola)
 
     def reiniciar_tras_actualizar(self):
         try:
@@ -8751,10 +8948,98 @@ Tarjeta.__init__.__defaults__ = (PANEL, 12, 14, None)   # el color por defecto d
 
 BTN = "#4a4468"
 
-PAGINA_OBS = ("<!doctype html><meta charset=utf-8><body style='margin:0;background:transparent;"
-              "font:900 64px Segoe UI,sans-serif;color:#35d3f2;text-shadow:0 0 6px #000,0 0 6px #000'>"
-              "<span id=n>0</span><script>async function t(){try{let d=await(await fetch('/datos')).json();"
-              "document.getElementById('n').textContent=d.total}catch(e){}}t();setInterval(t,500)</script>")
+PAGINA_OBS = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Contador de cofres</title>
+<style>
+html,body{margin:0;background:transparent;overflow:hidden}
+body{font-family:'Segoe UI Black','Segoe UI',Arial,sans-serif;font-weight:900;white-space:nowrap}
+#w{display:inline-block}
+.f{display:flex;align-items:center}
+</style></head><body><div id="w"></div>
+<script>
+const CONTORNO='#140e24',ORO='#ffc83d',VERDE='#3ddc84',CIAN='#6fd3ff',APAGADO='#8a84a6',PARTIDA='#c4b0ff';
+function esc(t){return String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function borde(px){
+  const o=px<24?1:Math.max(2,Math.floor(px/18));
+  return [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,1],[-1,1],[1,-1]].map(p=>(p[0]*o)+'px '+(p[1]*o)+'px 0 '+CONTORNO).join(',');
+}
+function t(txt,px,col){
+  return '<span style="font-size:'+px+'px;line-height:1.25;color:'+col+';text-shadow:'+borde(px)+'">'+esc(txt)+'</span>';
+}
+function pintar(d){
+  const s=d.tam, pad=Math.max(6,Math.floor(s/6));
+  let h='';
+  if(d.banner){
+    const sb=Math.max(16,Math.floor(s*0.5));
+    h+='<div style="padding:'+Math.floor(pad/2)+'px 0">'+t(d.banner.texto,sb,d.banner.color)+'</div>';
+  }
+  h+='<div class="f" style="gap:'+pad+'px;padding:'+Math.floor(pad/2)+'px 0">';
+  if(d.icono){
+    const iw=Math.floor(s*1.05);
+    h+='<img src="/icono.png" style="width:'+iw+'px;height:auto" onerror="this.style.display=\'none\'">';
+  }
+  h+=t(d.total,s,ORO);
+  if(d.ver_partida){h+=t(d.partida,Math.max(14,Math.floor(s*0.62)),PARTIDA);}
+  h+='</div>';
+  if(d.meta){
+    const hb=Math.max(16,Math.floor(s*0.4)), tm=Math.max(10,hb-6);
+    const pct=Math.min(1,d.meta.total/d.meta.valor)*100;
+    h+='<div style="position:relative;height:'+hb+'px;margin:'+Math.floor(pad/2)+'px 0;background:#2a2342;border:2px solid '+CONTORNO+'">'
+      +'<div style="position:absolute;left:0;top:0;bottom:0;width:'+pct+'%;background:'+(d.meta.hecho?VERDE:ORO)+'"></div>'
+      +'<div class="f" style="position:absolute;inset:0;justify-content:center">'+t(d.meta.total+' / '+d.meta.valor,tm,'#ffffff')+'</div></div>';
+  }
+  const s3=Math.max(14,Math.floor(s*0.5)), g3=Math.max(8,Math.floor(s3/2));
+  (d.amigos||[]).forEach(a=>{
+    h+='<div class="f" style="gap:'+g3+'px">'+t(a.nombre,s3,a.online?CIAN:APAGADO)+t(a.total,s3,ORO)
+      +(d.ver_partida?t(a.partida,s3,PARTIDA):'')+'</div>';
+  });
+  if(d.grupo!==null&&d.grupo!==undefined){
+    h+='<div class="f" style="gap:'+g3+'px">'+t('GRUPO',s3,VERDE)+t(d.grupo,s3,PARTIDA)+'</div>';
+  }
+  const w=document.getElementById('w');
+  w.style.padding='0 '+pad+'px';
+  w.style.minWidth=d.meta?Math.max(Math.floor(s*4.6),150)+'px':'0';
+  w.innerHTML=h;
+}
+let ultimo='';
+async function tic(){
+  try{
+    const r=await fetch('/datos',{cache:'no-store'});
+    const txt=await r.text();
+    if(txt!==ultimo){ultimo=txt;pintar(JSON.parse(txt));}
+  }catch(e){}
+}
+tic();setInterval(tic,250);
+</script></body></html>"""
+
+_ICONO_OBS = []
+
+
+def icono_obs_png(ancho=240):
+    """El cofre del número flotante (con su contorno oscuro) como PNG, para la página de OBS."""
+    if not _ICONO_OBS:
+        datos = None
+        try:
+            if icono_base() is not None:
+                k = ancho / 46.0
+                alto = int(round(38 * k))
+                g = max(2, ancho // 30)
+                cofre = icono_ajustado(max(4, ancho - 2 * g), max(4, alto - 2 * g))
+                tam = (cofre.width + 2 * g, cofre.height + 2 * g)
+                silueta = Image.new("L", tam, 0)
+                silueta.paste(cofre.split()[3], (g, g))
+                silueta = silueta.point(_lut(lambda v: v >= 90)).filter(ImageFilter.MaxFilter(2 * g + 1))
+                im = Image.new("RGBA", tam, _rgb(CONTORNO) + (255,))
+                im.alpha_composite(cofre, (g, g))
+                im.putalpha(silueta)
+                buf = io.BytesIO()
+                im.save(buf, "PNG")
+                datos = buf.getvalue()
+        except Exception:
+            datos = None
+        _ICONO_OBS.append(datos)
+    return _ICONO_OBS[0]
+
 
 TECLAS_DEF["overlay"] = "Ctrl+Mayús+O"
 TECLAS_DEF["mover"] = "Ctrl+Mayús+L"
@@ -8803,6 +9088,43 @@ class _UI:
         t.cuerpo._filas = 0
         return t.cuerpo
 
+    def fila_proximamente(self, caja, texto):
+        """Ajuste que aún no está programado: se ve (apagado y en gris) pero no se puede tocar."""
+        v = tk.BooleanVar(value=False)
+        f = self.fila(caja, texto, v, None, "Próximamente: todavía no funciona")
+        f.ajustar(activo=False)
+        try:
+            f.config(cursor="arrow")
+        except tk.TclError:
+            pass
+        return f
+
+    def iniciar_vigilancia_fortnite(self):
+        """Solo si lo abrió Fortnite: cuando el juego se cierra, el contador se cierra también."""
+        self._fn_cerrado = False
+
+        def hilo():
+            visto, fuera, t0 = False, 0, time.time()
+            while True:
+                time.sleep(3)
+                if fortnite_abierto():
+                    visto, fuera = True, 0
+                else:
+                    fuera += 1
+                    if fuera >= 3 and (visto or time.time() - t0 > 120):    # ~9 s sin Fortnite
+                        self._fn_cerrado = True
+                        return
+
+        threading.Thread(target=hilo, daemon=True).start()
+        self.root.after(2000, self.revisar_fortnite)
+
+    def revisar_fortnite(self):
+        if getattr(self, "_fn_cerrado", False):
+            if self.var_inicio.get():            # solo si «Abrir con Fortnite» sigue activado
+                self.cerrar()
+            return
+        self.root.after(2000, self.revisar_fortnite)
+
     def fila_ui(self, caja, texto, clave, defecto, detalle=None):
         v = tk.BooleanVar(value=bool(self.cfg_ui.get(clave, defecto)))
         setattr(self, "ui_" + clave, v)
@@ -8829,7 +9151,7 @@ class _UI:
         c = self.cfg_ov
         self.var_pitido, self.var_celebrar, self.var_lobby = B(self.ini_pitido), B(self.ini_celebrar), B(self.ini_lobby)
         self.var_solo_cofre, self.var_fotos, self.var_obs = B(self.ini_solo), B(self.ini_fotos), B(self.ini_obs)
-        self.var_inicio, self.var_encima, self.var_manual = B(inicio_windows_activo()), B(self.ini_encima), B(self.ini_manual)
+        self.var_inicio, self.var_encima, self.var_manual = B(inicio_fortnite_activo()), B(self.ini_encima), B(self.ini_manual)
         self.var_ocr, self.var_rep = B(self.ini_ocr), B(self.ini_rep)
         self.var_ov, self.var_mover = B(c.get("visible", False)), B(False)
         self.var_icono, self.var_partida = B(c.get("icono", True)), B(c.get("partida", False))
@@ -8867,13 +9189,18 @@ class _UI:
         lt.pack(fill="x")
         fila = tk.Frame(t.cuerpo, bg=PANEL)
         fila.pack(fill="x", pady=(2, 0))
-        if clave == "tesoros":
+        if clave == "tesoros":               # todavía no funciona: se ve apagada y con el aviso «pronto»
+            lt.config(text="Tesoros · pronto", fg=APAGADO)
+            color = APAGADO
             cv = tk.Canvas(fila, width=26, height=22, bg=PANEL, highlightthickness=0)
-            cv.create_polygon(13, 2, 24, 8, 13, 20, 2, 8, fill="", outline=TEXTO, width=2)
-            cv.create_line(2, 8, 24, 8, fill=TEXTO, width=2)
+            cv.create_polygon(13, 2, 24, 8, 13, 20, 2, 8, fill="", outline=APAGADO, width=2)
+            cv.create_line(2, 8, 24, 8, fill=APAGADO, width=2)
             cv.pack(side="left", padx=(0, 8))
         lv = tk.Label(fila, text="–", font=("Segoe UI Semibold", 20), fg=color, bg=PANEL, anchor="w")
         lv.pack(side="left")
+        if clave == "partidas":              # el número grande y «partidas» pequeño al lado: así cabe siempre
+            tk.Label(fila, text="partidas", font=("Segoe UI", 8), fg=APAGADO, bg=PANEL).pack(
+                side="left", padx=(5, 0), anchor="s", pady=(0, 6))
         self.res[clave], self.res_t[clave] = lv, lt
 
     def construir(self):
@@ -9018,7 +9345,7 @@ class _UI:
 
     def pintar_btn_overlay(self):
         b = self.btn_overlay
-        b._color = MORADO if self.var_ov.get() else BTN
+        b._color = "#2e9e5b" if self.var_ov.get() else "#4d5061"        # verde si está encendido, gris si no
         b.config(text="● Overlay")
 
     def actualizar_textos_teclas(self):
@@ -9062,9 +9389,9 @@ class _UI:
         T["dia"].config(text="Mejor día · %s" % md[0].strftime("%d/%m") if md else "Mejor día")
         R["media"].config(text=f1(st["media_total"]) if st["media_total"] is not None else "–")
         R["record"].config(text=str(st["mejor_partida"]))
-        R["partidas"].config(text="%d partidas" % st["partidas"])
+        R["partidas"].config(text=str(st["partidas"]))
         T["partidas"].config(text="Desde %s" % a_madrid(juegos[0][0][0]).strftime("%d/%m/%y") if juegos else "Desde")
-        R["tesoros"].config(text=str(tes))
+        R["tesoros"].config(text="–")          # los tesoros todavía no están activados
         self.grafica7.poner(st["dias14"][-7:])
         if ult:
             ini = a_madrid(ult[0][0])
@@ -9147,16 +9474,17 @@ class _UI:
         envolver(self.lbl_modo, c, 4, 120)
         self.aplicar_modo(guardar=False, avisar=False)
         c = self.caja(izq, "Inicio")
-        self.fila(c, "Abrir con Windows", self.var_inicio, self.al_cambiar_inicio, "Cuenta tus partidas sin pensar en ello")
+        self.fila(c, "Abrir con Fortnite", self.var_inicio, self.al_cambiar_inicio,
+                  "Se abre sola al encender Fortnite y se cierra cuando lo cierras")
         self.fila_ui(c, "Abrir estadísticas al iniciar", "abrir_informe", False)
         c = self.caja(izq, "Equipo y tesoros compartidos")
         self.fila_ui(c, "Mostrar compañeros", "mostrar_comp", True, "En la ventana y en las estadísticas")
         self.fila_ui(c, "Sumar sus cofres a tu total", "sumar_comp", False)
-        self.fila_ui(c, "Sumar tesoros del equipo", "sumar_tes", False)
+        self.fila_proximamente(c, "Sumar tesoros del equipo")
         c = self.caja(izq, "Contar también como cofre")
-        self.fila_ui(c, "Cajas de munición", "c_municion", False)
-        self.fila_ui(c, "Cajas de comida", "c_comida", False)
-        self.fila_ui(c, "Cañones de botín", "c_canon", False)
+        self.fila_proximamente(c, "Cajas de munición")
+        self.fila_proximamente(c, "Cajas de comida")
+        self.fila_proximamente(c, "Cañones de botín")
         c = self.caja(izq, "Overlay")
         self.fila(c, "Abrir overlay", self.var_ov, self.alternar_overlay, "Muestra el número encima del juego")
         self.fila(c, "Mover", self.var_mover, self.cambiar_mover, "Arrástralo donde quieras y apágalo para fijarlo")
@@ -9200,10 +9528,12 @@ class _UI:
         Segmentado(c, self.var_upd, (("Preguntar", "preguntar"), ("Automáticas", "auto"), ("Nunca", "nunca")),
                    guarda_upd, fondo=PANEL).pack(fill="x", pady=(8, 2))
         f = tk.Frame(c, bg=PANEL)
-        f.pack(fill="x", pady=(4, 0))
-        self.boton_texto(f, "Buscar ahora", lambda: self.buscar_actualizaciones(True), fg=ORO).pack(side="left")
-        self.lbl_upd = tk.Label(f, text="", font=("Segoe UI", 8), fg=APAGADO, bg=PANEL, anchor="w")
-        self.lbl_upd.pack(side="left", padx=8)
+        f.pack(fill="x", pady=(8, 0))
+        BotonSuave(f, "🔄  Buscar ahora", lambda: self.buscar_actualizaciones(True), MORADO, 14,
+                   ("Segoe UI Semibold", 10), 3, 12).pack(side="left")
+        self.lbl_upd = tk.Label(c, text="", font=("Segoe UI", 8), fg=APAGADO, bg=PANEL, anchor="w",
+                                justify="left", wraplength=235)
+        self.lbl_upd.pack(fill="x", pady=(6, 0))
         c = self.caja(der)
         f = tk.Frame(c, bg=PANEL)
         f.pack(fill="x")
@@ -9220,9 +9550,13 @@ class _UI:
         def copiar():
             self.root.clipboard_clear()
             self.root.clipboard_append(self.var_url.get())
-            self.aviso("Dirección del overlay copiada. En OBS: Fuente → Navegador → pega la dirección.")
+            self.aviso("Dirección del overlay copiada. En OBS: Fuente → Navegador → pega la dirección (ancho 800, alto 500 va bien).", 12)
 
         self.boton(f, "Copiar", copiar, BTN, 6).pack(side="left", padx=(6, 0))
+        tk.Label(c, text="Es una copia de tu overlay: enseña lo mismo que tengas activado en «Overlay» "
+                         "(partida, meta, amigos, grupo, tamaño), aunque el overlay del juego esté oculto.",
+                 font=("Segoe UI", 8), fg=APAGADO, bg=PANEL, anchor="w", justify="left", wraplength=240).pack(
+            fill="x", pady=(6, 0))
         c = self.caja(der, "Carpeta de replays")
         f = tk.Frame(c, bg=PANEL)
         f.pack(fill="x", pady=(6, 0))
@@ -9287,6 +9621,142 @@ class _UI:
         except tk.TclError:
             pass
 
+
+    # ---------- guía: Fortnite tiene que grabar repeticiones ----------
+    def dialogo_guia_replays(self, primera=False):
+        """Explica que en Fortnite hay que activar las repeticiones (Ajustes > Juego > Repeticiones) para que el
+        modo Replays pueda contar cofres. primera=True: bienvenida de la instalación nueva (sale antes que el
+        programa). primera=False: recordatorio, con otro texto, cada vez que se vuelve a elegir «Replays»."""
+        previa = getattr(self, "dlg_guia", None)
+        try:
+            if previa is not None and previa.winfo_exists():
+                previa.lift()
+                return previa
+        except tk.TclError:
+            pass
+        d = tk.Toplevel(self.root)
+        self.dlg_guia = d
+        d.withdraw()
+        d.title("Bienvenido al Contador de cofres" if primera else "Modo Replays")
+        d.configure(bg=BG)
+        d.resizable(False, False)
+        try:
+            poner_icono_ventana(d)
+        except Exception:
+            pass
+        try:
+            d.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        def cerrar(ev=None):
+            self.dlg_guia = None
+            try:
+                d.destroy()
+            except tk.TclError:
+                pass
+
+        d.protocol("WM_DELETE_WINDOW", cerrar)
+        d.bind("<Escape>", cerrar)
+        d.bind("<Return>", cerrar)
+
+        ANCHO = 440
+        marco = tk.Frame(d, bg=BG, highlightbackground=ORO, highlightcolor=ORO, highlightthickness=2)
+        marco.pack(fill="both", expand=True, padx=6, pady=6)
+        cuerpo = tk.Frame(marco, bg=BG)
+        cuerpo.pack(padx=26, pady=(18, 20))
+
+        if primera:
+            titulo = "¡Bienvenido al Contador de cofres!"
+            intro = ("Antes de empezar, hay un ajuste de Fortnite que tienes que activar para que el modo "
+                     "Replays pueda contar tus cofres. Solo hay que hacerlo una vez.")
+        else:
+            titulo = "Comprueba Fortnite antes de jugar"
+            intro = ("Has elegido contar los cofres con las repeticiones: al terminar cada partida se lee su "
+                     "repetición. Para que exista, Fortnite tiene que estar grabándola.")
+
+        tk.Label(cuerpo, text="🎞", font=("Segoe UI Emoji", 30), fg=ORO, bg=BG).pack()
+        tk.Label(cuerpo, text=titulo, font=("Segoe UI Semibold", 15), fg=ORO, bg=BG, wraplength=ANCHO,
+                 justify="center").pack(pady=(2, 4))
+        tk.Label(cuerpo, text=intro, font=("Segoe UI", 10), fg=TEXTO, bg=BG, wraplength=ANCHO,
+                 justify="center").pack(pady=(0, 12))
+
+        t = Tarjeta(cuerpo, pad=14, radio=14)
+        t.pack(fill="x")
+        c = t.cuerpo
+
+        def paso(n, texto):
+            f = tk.Frame(c, bg=PANEL)
+            f.pack(fill="x", pady=4)
+            cv = tk.Canvas(f, width=28, height=28, bg=PANEL, highlightthickness=0, bd=0)
+            cv.create_oval(2, 2, 26, 26, fill=ORO, outline="")
+            cv.create_text(14, 14, text=str(n), font=("Segoe UI Semibold", 11), fill=BG)
+            cv.pack(side="left", anchor="n", padx=(0, 10))
+            tk.Label(f, text=texto, font=("Segoe UI", 10), fg=TEXTO, bg=PANEL, wraplength=ANCHO - 90,
+                     justify="left", anchor="w").pack(side="left", fill="x", expand=True, pady=(4, 0))
+
+        def casillas():
+            for nombre in ("Grabar repeticiones", "Grabar repeticiones de equipos grandes"):
+                r = tk.Frame(c, bg=CARD)
+                r.pack(fill="x", padx=(38, 0), pady=3)
+                tk.Label(r, text=nombre, font=("Segoe UI Semibold", 10), fg=TEXTO, bg=CARD,
+                         anchor="w").pack(side="left", padx=10, pady=6)
+                tk.Label(r, text="● ACTIVADO", font=("Segoe UI Semibold", 8), bg="#10301f", fg=VERDE,
+                         padx=8, pady=2).pack(side="right", padx=8)
+
+        if primera:
+            paso(1, "Abre Fortnite y entra en Ajustes.")
+            paso(2, "Ve al apartado «Juego» y baja casi hasta el final, hasta la sección «Repeticiones».")
+            paso(3, "Activa estas dos opciones y déjalas así:")
+            casillas()
+            nota = ("Sin esto, Fortnite no guarda la repetición de tus partidas y el modo Replays no tiene nada "
+                    "que leer: no se sumaría ningún cofre. Si prefieres no usarlo, en Ajustes puedes cambiar a "
+                    "«Manual» o «Pantalla».")
+            boton = "Entendido, abrir el contador"
+        else:
+            paso(1, "En Fortnite ve a Ajustes ▸ Juego y baja hasta «Repeticiones» (está casi al final).")
+            paso(2, "Comprueba que estas dos opciones estén así:")
+            casillas()
+            nota = ("Si alguna está apagada, la partida no se graba y sus cofres no se podrán contar. "
+                    "Este recordatorio sale cada vez que eliges «Replays».")
+            boton = "Lo tengo activado"
+
+        tk.Label(cuerpo, text=nota, font=("Segoe UI", 9), fg=APAGADO, bg=BG, wraplength=ANCHO, justify="center"
+                 ).pack(pady=(12, 0))
+        BotonSuave(cuerpo, boton, cerrar, "#2e9e5b", 20, ("Segoe UI Semibold", 11), 5, 14).pack(pady=(16, 0))
+
+        d.update_idletasks()
+        w, h = d.winfo_reqwidth(), d.winfo_reqheight()
+        sw, sh = d.winfo_screenwidth(), d.winfo_screenheight()
+        if primera:
+            x, y = (sw - w) // 2, max(0, (sh - h) // 2 - 20)
+        else:
+            try:
+                x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+                y = self.root.winfo_rooty() + 30
+            except tk.TclError:
+                x, y = (sw - w) // 2, (sh - h) // 2
+        x = max(0, min(x, sw - w))
+        y = max(0, min(y, sh - h - 40))
+        d.geometry("+%d+%d" % (x, y))
+        d.deiconify()
+        d.after(40, lambda: estilo_barra_titulo(d))
+        self.aparecer(d)
+        try:
+            d.lift()
+            d.focus_force()
+        except tk.TclError:
+            pass
+        if primera:
+            def bloquear():
+                try:
+                    d.grab_set()
+                except tk.TclError:
+                    pass
+
+            d.after(80, bloquear)
+        return d
+
     TEXTOS_MODO = {
         "manual": "Solo cuentas tú, con el atajo o el botón +1. No se mira la pantalla ni se leen repeticiones.",
         "pantalla": "Se cuentan solos mirando los avisos de la pantalla. No se leen repeticiones.",
@@ -9307,6 +9777,8 @@ class _UI:
             self.aviso(self.TEXTOS_MODO[m], 12)
         if guardar:
             self.guardar()
+        if avisar and m == "replays":          # cada vez que se vuelve a Replays: recordatorio de lo de Fortnite
+            self.dialogo_guia_replays(primera=False)
 
     def al_cambiar_manual(self):
         """El atajo «conteo automático» alterna entre manual y pantalla."""
@@ -9354,20 +9826,60 @@ class _UI:
             return
         return _buscar_orig(self, manual)
 
+    def datos_obs(self):
+        """Lo mismo que dibuja el número flotante, para que la página de OBS sea una copia (con los mismos
+        interruptores de «Qué enseñar» y el mismo tamaño). Se prepara aquí, en el hilo de la ventana."""
+        ver_partida = bool(self.var_partida.get())
+        amigos = self.amigos_overlay()
+        ban = self.banner_actual()
+        return {
+            "total": self.total, "partida": self.sesion,
+            "tam": TAMANOS.get(self.var_tam.get(), 54),
+            "icono": bool(self.var_icono.get()),
+            "ver_partida": ver_partida,
+            "banner": {"texto": ban[0], "color": ban[1]} if ban else None,
+            "meta": self.meta_info() if self.var_meta.get() else None,
+            "amigos": ([{"nombre": a["nombre"], "total": a["total"], "partida": a["partida"],
+                         "online": bool(a["online"])} for a in amigos] if self.var_amigo.get() else []),
+            "grupo": self.total_grupo() if (self.var_grupo.get() and amigos) else None,
+        }
+
+    def ciclo_obs(self):
+        """Mantiene al día lo que ve OBS. Si nadie lo está mirando, casi no gasta nada."""
+        ms = 1000
+        try:
+            if time.time() - self._obs_visto < 6.0:
+                self._obs_json = json.dumps(self.datos_obs())
+                ms = 250
+        except Exception:
+            pass
+        self.root.after(ms, self.ciclo_obs)
+
     def servidor_overlay(self):
         app = self
+        self._obs_json = json.dumps({"total": self.total, "partida": self.sesion})
+        self._obs_visto = 0.0
+        self.root.after(500, self.ciclo_obs)
 
         class H(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
 
             def do_GET(self):
+                cache = "no-store"
                 if self.path.startswith("/datos"):
-                    cuerpo, tipo = json.dumps({"total": app.total, "partida": app.sesion}).encode(), "application/json"
+                    app._obs_visto = time.time()          # alguien (OBS) está mirando: se prepara el estado
+                    cuerpo, tipo = app._obs_json.encode("utf-8"), "application/json"
+                elif self.path.startswith("/icono.png"):
+                    cuerpo, tipo, cache = icono_obs_png(), "image/png", "max-age=3600"
+                    if not cuerpo:
+                        self.send_error(404)
+                        return
                 else:
                     cuerpo, tipo = PAGINA_OBS.encode("utf-8"), "text/html; charset=utf-8"
                 self.send_response(200)
                 self.send_header("Content-Type", tipo)
+                self.send_header("Cache-Control", cache)
                 self.send_header("Content-Length", str(len(cuerpo)))
                 self.end_headers()
                 self.wfile.write(cuerpo)
@@ -9893,6 +10405,10 @@ if __name__ == "__main__":
         _r.destroy()
     else:
         identidad_app()
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)     # sin esto, Windows despierta los temporizadores cada
+        except Exception:                              # ~15,6 ms y las animaciones se quedan en ~30 fps
+            pass
         root = tk.Tk()
         App(root)
         root.mainloop()
