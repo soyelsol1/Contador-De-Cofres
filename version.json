@@ -2,6 +2,6 @@
   "version": "1.3.7",
   "archivo": "contador_cofres.py",
   "sha256": "a254b00c4b920a91d3385524ced09fc69a0ba4c8a9191451db09358a2f3a3f21",
-  "obligatoria": true,
+  "obligatoria": false,
   "notas": ""
 }
