@@ -2,7 +2,7 @@
   "version": "1.3.9",
   "archivo": "contador_cofres.py",
   "sha256": "a680d7da09e4546031e9cdd4aae6abf59dbc1411e4beffa2b654c27250ca17a0",
-  "obligatoria": false,
+  "obligatoria": true,
   "extras": [
     {
       "archivo": "lector_repeticiones.py",
