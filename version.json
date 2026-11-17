@@ -1,7 +1,7 @@
 {
-  "version": "1.4.0",
+  "version": "1.4.1",
   "archivo": "contador_cofres.py",
-  "sha256": "b0336ba24e49dbf66b453f2c243ca2d3553b07fe733ab243f194710f998fa4a0",
+  "sha256": "dd65df14e52329e62e67cb76c98c99b6ce5774aa5e6dd782cce8d92a23e1408d",
   "obligatoria": true,
   "extras": [
     {
@@ -9,5 +9,5 @@
       "sha256": "ab3d28b35641f705c4ed9511f17d9028ed00d937b01bd8cb342b8089e2bd7605"
     }
   ],
-  "notas": "🎨 Nueva interfaz, más moderna e intuitiva.\n\n📦 Nuevo sistema de detección y recuento de cofres mediante las repeticiones (replays) de Fortnite.\n\n⚙️ Nuevos ajustes y opciones de configuración.\n\n✨ Mejoras generales de funcionamiento y optimización."
+  "notas": ""
 }
