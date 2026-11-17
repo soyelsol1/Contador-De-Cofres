@@ -112,13 +112,15 @@ def _migrar_datos_antiguos():
 _migrar_datos_antiguos()
 
 # ---------------------------------------------------------------- actualización automática
-VERSION = "1.3.6"
+VERSION = "1.3.7"
 REPO_RAW = "https://raw.githubusercontent.com/soyelsol1/Contador-De-Cofres/main"
 # Base de datos de las salas: la misma para todo el mundo, ya viene dentro del programa.
 URL_SALAS = "https://cofres-7beb6-default-rtdb.europe-west1.firebasedatabase.app"
 CARPETA_CODIGO = os.path.join(DATOS, "codigo")
 ARCHIVO_CODIGO = os.path.join(CARPETA_CODIGO, "contador_cofres.py")
 CARPETA_COPIAS = os.path.join(DATOS, "copias")
+# Archivos de apoyo que el programa necesita además de este. Se bajan solos a «codigo» (dentro de la carpeta de datos).
+ARCHIVOS_EXTRA = ("lector_repeticiones.py",)
 
 
 def version_tupla(v):
@@ -154,6 +156,46 @@ def buscar_actualizacion():
     return None
 
 
+def _nombre_extra_valido(nombre):
+    n = os.path.basename(str(nombre or ""))
+    ok = re.fullmatch(r"[A-Za-z0-9_]+\.py", n) and n.lower() != "contador_cofres.py"
+    return n if ok else ""
+
+
+def _extras_de(info):
+    """Archivos de apoyo de esta versión: [(nombre, sha256, obligatorio)].
+    Si version.json no los lista (publicador antiguo), se usan los de siempre, sin ser obligatorios."""
+    lista = info.get("extras") if isinstance(info, dict) else None
+    if not isinstance(lista, list):
+        return [(n, "", False) for n in ARCHIVOS_EXTRA]
+    res = []
+    for x in lista:
+        d = x if isinstance(x, dict) else {"archivo": x}
+        n = _nombre_extra_valido(d.get("archivo"))
+        if n:
+            res.append((n, str(d.get("sha256") or "").lower(), True))
+    return res
+
+
+def _bajar_extra(nombre, sha="", timeout=40):
+    """Baja un archivo de apoyo y lo comprueba (tamaño, firma y que sea Python válido)."""
+    datos = _get_raw(nombre, timeout).replace(b"\r\n", b"\n")
+    if len(datos) < 500:
+        raise ValueError("«%s» ha llegado incompleto" % nombre)
+    if sha and hashlib.sha256(datos).hexdigest() != sha:
+        raise ValueError("«%s» no coincide con su firma (reintenta en unos minutos)" % nombre)
+    compile(datos.decode("utf-8"), nombre, "exec")
+    return datos
+
+
+def _escribir_codigo(ruta, datos):
+    os.makedirs(os.path.dirname(ruta), exist_ok=True)
+    tmp = ruta + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(datos)
+    os.replace(tmp, ruta)
+
+
 def descargar_actualizacion(info):
     nombre = os.path.basename(str(info.get("archivo") or "contador_cofres.py"))
     datos = _get_raw(nombre, 40).replace(b"\r\n", b"\n")
@@ -166,11 +208,38 @@ def descargar_actualizacion(info):
     if version_de_codigo(texto) != str(info.get("version")):
         raise ValueError("la versión del archivo no coincide con version.json")
     compile(texto, nombre, "exec")
-    os.makedirs(CARPETA_CODIGO, exist_ok=True)
-    tmp = ARCHIVO_CODIGO + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(datos)
-    os.replace(tmp, ARCHIVO_CODIGO)
+    # Archivos de apoyo (lector de repeticiones...): primero se bajan y comprueban TODOS; solo si todo está bien
+    # se escribe algo, y el programa va el último, así una descarga a medias nunca deja una mezcla rota.
+    extras = []
+    for n, sha_x, obligatorio in _extras_de(info):
+        ruta = os.path.join(CARPETA_CODIGO, n)
+        if sha_x and os.path.isfile(ruta):
+            try:
+                with open(ruta, "rb") as f:
+                    if hashlib.sha256(f.read()).hexdigest() == sha_x:
+                        continue            # ya lo tienes igual: no se vuelve a bajar
+            except OSError:
+                pass
+        try:
+            extras.append((ruta, _bajar_extra(n, sha_x)))
+        except Exception as e:
+            if obligatorio:
+                raise ValueError("no se pudo bajar «%s»: %s" % (n, e))
+    for ruta, d in extras:
+        _escribir_codigo(ruta, d)
+    _escribir_codigo(ARCHIVO_CODIGO, datos)
+
+
+def asegurar_extras():
+    """Si falta algún archivo de apoyo (por ejemplo al actualizar desde una versión antigua que solo bajaba el
+    programa), lo baja una vez. Si no hay internet no pasa nada: se intentará en el próximo arranque."""
+    for n in ARCHIVOS_EXTRA:
+        if os.path.isfile(os.path.join(CARPETA_CODIGO, n)) or os.path.isfile(os.path.join(CARPETA, n)):
+            continue
+        try:
+            _escribir_codigo(os.path.join(CARPETA_CODIGO, n), _bajar_extra(n, "", 8))
+        except Exception as e:
+            registrar_error("no se pudo bajar %s: %s" % (n, e))
 
 
 def _lanzar_codigo_nuevo():
@@ -5471,6 +5540,8 @@ class App:
         copia_diaria()
 
         datos = self.cargar()
+        if not datos:      # instalación nueva (no hay archivo de datos): el modo «Replays» viene activado por defecto
+            datos = {"ui": {"modo_conteo": "replays"}, "manual": True, "repeticion": True}
         # ajustes nuevos: ventana encima de las demás o no, conteo solo manual y lector de texto
         self.ini_encima = bool(datos.get("encima", False))
         self.ini_manual = bool(datos.get("manual", False))
@@ -7885,7 +7956,7 @@ class App:
             self.aplicar_recuento({"res": res, "contados": contados, "t": ahora,
                                    "indice": (len(self.hist.partidas) - 1) if guardada else None})
             return
-        if v["hilo"] is not None or ahora - v["t"] < 0.5:
+        if v["hilo"] is not None or ahora - v["t"] < 0.25:
             return
         v["t"] = ahora
         ruta = repeticion_reciente(self.t_inicio - 5)              # solo repeticiones de partidas jugadas con el programa abierto
@@ -8089,8 +8160,8 @@ class App:
 
     def aplicar_lobby(self, info):
         """info = lo que devuelve mirar_lobby() (se calcula en segundo plano)."""
-        if info is None:
-            return
+        if info is None or self.cfg_ui.get("modo_conteo") == "replays":
+            return          # en modo replays la partida se cierra al terminar la repetición, no con el lobby
         ok, fa, fp, modo = info
         self.lobby_info = (fa, fp)
         # Si hay un aviso de cofre sostenido en pantalla, no puede ser el lobby (falso positivo)
@@ -8327,7 +8398,7 @@ class App:
         que sigue (si lo tienes activado) es cerrar la partida al volver al lobby."""
         if self.avisos_conf or self.n_visto or self.seguidor.pistas or self.ses_cont:
             self.reiniciar_detector()
-        if self.var_lobby.get():
+        if self.var_lobby.get() and self.cfg_ui.get("modo_conteo") != "replays":
             self.tick_n += 1
             r = self.trab.recoger()
             if r is not None and r[0]:
@@ -9137,7 +9208,7 @@ class _UI:
     TEXTOS_MODO = {
         "manual": "Solo cuentas tú, con el atajo o el botón +1. No se mira la pantalla ni se leen repeticiones.",
         "pantalla": "Se cuentan solos mirando los avisos de la pantalla. No se leen repeticiones.",
-        "replays": "No se cuenta en directo: al terminar cada partida (lobby o «Nueva partida») se lee su "
+        "replays": "No se cuenta en directo: al terminar cada partida (en cuanto Fortnite cierra la repetición, sin esperar al lobby) se lee su "
                    "repetición y se suman los cofres. En Fortnite tiene que estar activado «Grabar repeticiones».",
     }
 
@@ -9260,10 +9331,23 @@ App.__init__ = _init_seguro
 # Si lector_repeticiones.py está junto al programa, el recuento al final de cada partida usa ese lector
 # (no necesita la DLL de Oodle). Si no está o falla, se usa el sistema anterior (DLL).
 # Ojo: ese archivo es GPL v3; si compartes el programa con alguien, también debe compartirse bajo GPL v3.
+# El lector se busca junto al programa y, si no está, en «codigo» (carpeta de datos), donde lo deja la actualización.
+try:
+    asegurar_extras()
+except Exception:
+    pass
+if CARPETA_CODIGO not in sys.path:
+    sys.path.append(CARPETA_CODIGO)         # al final: si lo tienes junto al programa, manda ese
+try:
+    import importlib
+    importlib.invalidate_caches()
+except Exception:
+    pass
 try:
     import lector_repeticiones as _lector_rep
-except Exception:
+except Exception as _e_lector:
     _lector_rep = None
+    registrar_error("lector_repeticiones no disponible: %s" % (_e_lector or type(_e_lector).__name__))
 _analizar_dll = analizar_repeticion
 _buscar_oodle_orig = buscar_oodle
 
