@@ -1,7 +1,7 @@
 {
-  "version": "1.3.5",
+  "version": "1.3.6",
   "archivo": "contador_cofres.py",
-  "sha256": "d7aa985438d7c71ee081a67a9c7b34a5828ad029bbbf86ac91306f0bed017cbf",
+  "sha256": "db9469b9919d1f69fcae6ecb5f48e1f76a29e5967bcb08f1c23a4d71b7b4bfe0",
   "obligatoria": true,
-  "notas": "Nueva interfaz, deteccion de cofres mediante replays, nuevos ajustes"
+  "notas": "Nueva interfaz, deteccion de cofres por replays, nuevos ajustes.."
 }
